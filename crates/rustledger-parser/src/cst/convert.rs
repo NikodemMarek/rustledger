@@ -2093,6 +2093,20 @@ fn custom_value_check(
 /// Matches the legacy parser, which fails its inner posting
 /// parser on such lines and recovers by skipping to the next
 /// NEWLINE while emitting a `SyntaxError`.
+/// The `unexpected input` diagnostic for one catch-all transaction-body line.
+///
+/// Mirrors `green::unexpected_body_input`; shared by the newline- and
+/// EOF-terminated sites so the span rule cannot drift between them.
+fn unexpected_body_input(line_start: u32, end: u32, bom_offset: u32) -> crate::ParseError {
+    crate::ParseError::new(
+        crate::ParseErrorKind::SyntaxError("unexpected input".to_string()),
+        Span::new(
+            (line_start + bom_offset) as usize,
+            (end + bom_offset) as usize,
+        ),
+    )
+}
+
 fn transaction_body_check(
     child: &crate::SyntaxNode,
     bom_offset: u32,
@@ -2134,15 +2148,7 @@ fn transaction_body_check(
                     }
                     if t.kind() == crate::SyntaxKind::NEWLINE {
                         if line_has_content && let Some(ls) = line_start {
-                            // Skip leading WHITESPACE in the span.
-                            let span =
-                                Span::new((ls + bom_offset) as usize, (end + bom_offset) as usize);
-                            // Find first non-whitespace position
-                            // for a tighter span matching legacy.
-                            out.push(crate::ParseError::new(
-                                crate::ParseErrorKind::SyntaxError("unexpected input".to_string()),
-                                span,
-                            ));
+                            out.push(unexpected_body_input(ls, end, bom_offset));
                         }
                         line_start = None;
                         line_has_content = false;
@@ -2168,6 +2174,15 @@ fn transaction_body_check(
                 }
             }
         }
+        // EOF terminates the final body line, same as a NEWLINE. Mirrors
+        // `green::tl_transaction_body_check` (#1884).
+        if past_header
+            && line_has_content
+            && let Some(ls) = line_start
+        {
+            let end: u32 = child.text_range().end().into();
+            out.push(unexpected_body_input(ls, end, bom_offset));
+        }
     }
 }
 
@@ -2180,6 +2195,46 @@ fn transaction_body_check(
 /// `InvalidAccount`; otherwise → `SyntaxError("unexpected
 /// input")`. `stripped` is the post-BOM-strip source so token
 /// `text_range` indices into it correctly.
+/// Emit the recovery diagnostics for one `ERROR_NODE` line.
+///
+/// Mirrors `green::emit_error_node_line`, and exists for the same reason:
+/// this runs from BOTH the newline-terminated and the EOF-terminated site, and
+/// two inline copies is how the span rule or the secondary BOM diagnostic
+/// drifts between them.
+fn emit_error_node_line(
+    first_non_trivia: Option<crate::SyntaxKind>,
+    line_start: Option<u32>,
+    end: u32,
+    bom_offset: u32,
+    stripped: &str,
+    out: &mut Vec<crate::ParseError>,
+) {
+    let is_section = matches!(first_non_trivia, Some(crate::SyntaxKind::STAR));
+    let is_comment = matches!(first_non_trivia, Some(k) if is_comment_kind(k));
+    if is_section || is_comment || first_non_trivia.is_none() {
+        return;
+    }
+    let Some(ls) = line_start else { return };
+    // Legacy span INCLUDES the terminator NEWLINE (skip_to_newline consumes it
+    // before span_from is called); at EOF the terminator is the node end.
+    let span = Span::new((ls + bom_offset) as usize, (end + bom_offset) as usize);
+    let line_text = stripped.get(ls as usize..end as usize).unwrap_or("");
+    let primary = classify_recovery_error(line_text, span);
+    let primary_is_bom = matches!(primary.kind, crate::ParseErrorKind::BomInDirectiveBody);
+    out.push(primary);
+    // Additive secondary `BomInDirectiveBody` when a different primary
+    // diagnostic already fired AND the line ALSO contains a BOM byte. Matches
+    // legacy `parser.rs:2258-2263`: without it, a Windows-exported line with
+    // both problems surfaces only the actionable root cause and the user has no
+    // clue the invisible BOM byte is also corrupting the line.
+    if !primary_is_bom && line_text.contains(crate::bom::BOM_CHAR) {
+        out.push(
+            crate::ParseError::new(crate::ParseErrorKind::BomInDirectiveBody, span)
+                .with_hint(crate::diagnostics::BOM_REMOVAL_HINT),
+        );
+    }
+}
+
 fn error_node_check(
     child: &crate::SyntaxNode,
     stripped: &str,
@@ -2201,39 +2256,7 @@ fn error_node_check(
                 line_start = Some(start);
             }
             if t.kind() == crate::SyntaxKind::NEWLINE {
-                // Decide the line's classification.
-                let is_section = matches!(first_non_trivia, Some(crate::SyntaxKind::STAR));
-                let is_comment = matches!(first_non_trivia, Some(k) if is_comment_kind(k));
-                if !is_section
-                    && !is_comment
-                    && first_non_trivia.is_some()
-                    && let Some(ls) = line_start
-                {
-                    // Legacy span INCLUDES the terminator NEWLINE
-                    // (skip_to_newline consumes it before
-                    // span_from is called).
-                    let span = Span::new((ls + bom_offset) as usize, (end + bom_offset) as usize);
-                    let line_text = stripped.get(ls as usize..end as usize).unwrap_or("");
-                    let primary = classify_recovery_error(line_text, span);
-                    let primary_is_bom =
-                        matches!(primary.kind, crate::ParseErrorKind::BomInDirectiveBody);
-                    out.push(primary);
-                    // Additive secondary `BomInDirectiveBody` when
-                    // a different primary diagnostic (Unicode
-                    // account / generic syntax) already fired AND
-                    // the line ALSO contains a BOM byte. Matches
-                    // legacy `parser.rs:2258-2263`: without this,
-                    // a Windows-exported line with both problems
-                    // surfaces only the actionable root cause and
-                    // the user has no clue the invisible BOM byte
-                    // is also corrupting the line.
-                    if !primary_is_bom && line_text.contains(crate::bom::BOM_CHAR) {
-                        out.push(
-                            crate::ParseError::new(crate::ParseErrorKind::BomInDirectiveBody, span)
-                                .with_hint(crate::diagnostics::BOM_REMOVAL_HINT),
-                        );
-                    }
-                }
+                emit_error_node_line(first_non_trivia, line_start, end, bom_offset, stripped, out);
                 line_start = None;
                 first_non_trivia = None;
                 continue;
@@ -2242,6 +2265,12 @@ fn error_node_check(
                 first_non_trivia = Some(t.kind());
             }
         }
+        // EOF terminates the final line exactly as a NEWLINE would. Mirrors
+        // `green::tl_error_node_check`; without it the two paths disagree on
+        // any input lacking a trailing newline, and a malformed last line
+        // produced no diagnostic at all (#1884).
+        let end: u32 = child.text_range().end().into();
+        emit_error_node_line(first_non_trivia, line_start, end, bom_offset, stripped, out);
     }
 }
 
@@ -2481,6 +2510,14 @@ fn section_marker_check(
         if first_non_trivia.is_none() && !is_trivia_kind(t.kind()) {
             first_non_trivia = Some(t.kind());
         }
+    }
+    // EOF terminates the final line. Mirrors `green::tl_section_marker_check`.
+    if first_non_trivia == Some(crate::SyntaxKind::STAR)
+        && let Some(ls) = line_start
+    {
+        let end: u32 = child.text_range().end().into();
+        let span = Span::new((ls + bom_offset) as usize, (end + bom_offset) as usize);
+        out.push(Spanned::new(String::new(), span));
     }
 }
 
