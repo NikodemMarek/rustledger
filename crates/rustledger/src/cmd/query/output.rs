@@ -37,8 +37,10 @@ pub(super) fn execute_query<W: Write>(
         .execute(&query)
         .with_context(|| "failed to execute query")?;
 
-    // Output results using display context for consistent number formatting
-    let ctx = &settings.display_context;
+    // Output results using display context for consistent number formatting.
+    // `render_commas` is resolved ONCE here, against the surface being written,
+    // so each writer receives a context it can use verbatim (#1892).
+    let ctx = &settings.display_context.for_surface(settings.format.into());
     match settings.format {
         super::OutputFormat::Text => write_text(&result, writer, settings.numberify, ctx)?,
         super::OutputFormat::Csv => write_csv(&result, writer, settings.numberify, ctx)?,
@@ -67,6 +69,15 @@ fn write_text<W: Write>(
     // calling it per row would inflate the ledger's sample frequencies by N
     // and could shift the column's effective mode. Caught by Copilot review.
     let mut col_contexts: Vec<DisplayContext> = vec![DisplayContext::new(); result.columns.len()];
+    // `render_commas` is presentation policy for the whole table, not a
+    // per-column precision fact, so every column carries it regardless of what
+    // it holds. It used to arrive only as a side effect of the Number-column
+    // `update_from` below, which meant `SUM(number)` printed `1,234,567.89`
+    // while `SUM(position)` in the same query printed `1234567.89 USD`
+    // (issue #1892).
+    for col in &mut col_contexts {
+        col.set_render_commas(ctx.render_commas());
+    }
     let mut col_inherited: Vec<bool> = vec![false; result.columns.len()];
     for row in &result.rows {
         for (i, value) in row.iter().enumerate() {
@@ -218,6 +229,9 @@ fn write_csv<W: Write>(
     numberify: bool,
     ctx: &DisplayContext,
 ) -> Result<()> {
+    // `ctx` already has `render_commas` resolved for this surface by the
+    // dispatcher, so it is used verbatim here.
+
     // Print header
     writeln!(writer, "{}", result.columns.join(","))?;
 
@@ -1839,5 +1853,82 @@ mod tests {
             last_cell, "0.00",
             "currency-named column drives padding regardless of PIVOT path; row was {data_row:?}"
         );
+    }
+
+    /// `render_commas` is a property of the TABLE, not of a column's contents:
+    /// every column honors it, whatever kind of value it holds (#1892).
+    ///
+    /// It previously arrived only as a side effect of the Number-column
+    /// precision inheritance, so one query printed `SUM(number)` with
+    /// separators and `SUM(position)` without them.
+    #[test]
+    fn render_commas_applies_to_every_column_kind() {
+        use rustledger_core::{Amount, Position};
+        use rustledger_query::QueryResult;
+        let mut ctx = DisplayContext::new();
+        ctx.set_render_commas(true);
+        ctx.update(rust_decimal_macros::dec!(1234567.89), "USD");
+
+        let mut result = QueryResult::new(vec!["num".into(), "pos".into()]);
+        result.add_row(vec![
+            Value::Number(rust_decimal_macros::dec!(1234567.89)),
+            Value::Position(Box::new(Position::simple(Amount::new(
+                rust_decimal_macros::dec!(1234567.89),
+                "USD",
+            )))),
+        ]);
+
+        let mut out = Vec::new();
+        write_text(&result, &mut out, false, &ctx).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            text.matches("1,234,567.89").count(),
+            2,
+            "both the Number and the Position column must carry separators:\n{text}"
+        );
+    }
+
+    /// Machine-readable surfaces must never emit thousands separators, even
+    /// when the ledger asks for them (#1892).
+    ///
+    /// A separator forces the field to be quoted and then breaks ordinary
+    /// decimal parsers. Asserted through the SAME surface resolution the
+    /// dispatcher performs, so this covers the wiring and not just the
+    /// writer: a future format mapped to the wrong `OutputSurface` fails here.
+    #[test]
+    fn machine_surfaces_never_emit_thousands_separators() {
+        use rustledger_core::OutputSurface;
+        use rustledger_query::QueryResult;
+        let mut ledger_ctx = DisplayContext::new();
+        ledger_ctx.set_render_commas(true);
+        ledger_ctx.update(rust_decimal_macros::dec!(1234567.89), "USD");
+
+        let mut result = QueryResult::new(vec!["sum".into()]);
+        result.add_row(vec![Value::Number(rust_decimal_macros::dec!(1234567.89))]);
+
+        for format in [
+            super::super::OutputFormat::Csv,
+            super::super::OutputFormat::Json,
+            super::super::OutputFormat::Beancount,
+        ] {
+            let surface: OutputSurface = format.into();
+            assert!(
+                !surface.renders_thousands_separators(),
+                "{format:?} is not a human-reading surface"
+            );
+            let ctx = ledger_ctx.for_surface(surface);
+
+            let mut out = Vec::new();
+            write_csv(&result, &mut out, false, &ctx).expect("write");
+            let csv = String::from_utf8(out).expect("utf8");
+            assert!(
+                csv.contains("1234567.89"),
+                "{format:?}: value must render unseparated: {csv}"
+            );
+            assert!(
+                !csv.contains("1,234,567.89") && !csv.contains('"'),
+                "{format:?}: no separators and therefore no quoting: {csv}"
+            );
+        }
     }
 }

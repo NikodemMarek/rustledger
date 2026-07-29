@@ -118,6 +118,43 @@ pub enum Precision {
     Maximum,
 }
 
+/// What kind of consumer an output surface is written for.
+///
+/// Decides whether thousands separators appear. They are a HUMAN-READING
+/// affordance, so they belong only in rendered tables and reports:
+///
+/// - **machine interchange** (CSV, JSON) must stay parseable — a separator
+///   forces the field to be quoted and is then rejected by ordinary decimal
+///   parsers (issue #1892);
+/// - **ledger text** (`format`, `query --format beancount`) has one canonical
+///   on-disk form, and `,` is locale-ambiguous.
+///
+/// This exists so the rule is stated ONCE. It was previously re-derived per
+/// writer, and the surfaces had already drifted apart: `query --format
+/// beancount` emitted separators into ledger text while `format` stripped
+/// them, and CSV emitted them while JSON did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSurface {
+    /// A rendered table or report read by a person.
+    Human,
+    /// CSV/JSON consumed by another program.
+    Machine,
+    /// Beancount source text.
+    LedgerText,
+}
+
+impl OutputSurface {
+    /// Whether this surface renders thousands separators when the ledger asks
+    /// for them.
+    #[must_use]
+    pub const fn renders_thousands_separators(self) -> bool {
+        match self {
+            Self::Human => true,
+            Self::Machine | Self::LedgerText => false,
+        }
+    }
+}
+
 /// Display context for formatting numbers with consistent precision per currency.
 ///
 /// Tracks a frequency distribution of decimal places per currency and exposes
@@ -293,6 +330,28 @@ impl DisplayContext {
     #[must_use]
     pub fn has_fixed_precision(&self, currency: &str) -> bool {
         self.fixed_precisions.contains_key(currency)
+    }
+
+    /// This context, adjusted for the surface it will be written to.
+    ///
+    /// Only `render_commas` is affected — precision is a property of the data
+    /// and is identical on every surface. See [`OutputSurface`] for why the
+    /// distinction exists.
+    ///
+    /// Borrows unless the flag actually has to change, so the common cases
+    /// cost nothing: a ledger without `render_commas` (almost all of them) and
+    /// any human-facing surface both borrow. Only suppressing separators for a
+    /// machine or ledger-text surface clones, and that clone carries the
+    /// per-currency histograms — worth avoiding on a REPL's hot path, and
+    /// wasted entirely on the JSON writer, which ignores the context.
+    #[must_use]
+    pub fn for_surface(&self, surface: OutputSurface) -> std::borrow::Cow<'_, Self> {
+        if !self.render_commas || surface.renders_thousands_separators() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut ctx = self.clone();
+        ctx.render_commas = false;
+        std::borrow::Cow::Owned(ctx)
     }
 
     /// Set the `render_commas` flag.
@@ -1741,5 +1800,75 @@ mod custom_directive_precision_tests {
         ];
         let ctx = DisplayContext::from_directives(directives.iter(), std::iter::empty());
         assert_eq!(ctx.get_precision("USD"), Some(2));
+    }
+
+    /// The surface rule, stated once and asserted here so a new
+    /// `OutputSurface` variant cannot quietly default to rendering separators
+    /// (#1892).
+    #[test]
+    fn only_human_surfaces_render_thousands_separators() {
+        assert!(OutputSurface::Human.renders_thousands_separators());
+        assert!(!OutputSurface::Machine.renders_thousands_separators());
+        assert!(
+            !OutputSurface::LedgerText.renders_thousands_separators(),
+            "ledger text has one canonical form; `format` strips separators \
+             and `query --format beancount` must agree with it"
+        );
+    }
+
+    /// `for_surface` avoids cloning whenever the flag does not have to change.
+    ///
+    /// The clone carries the per-currency histograms, and the JSON writer
+    /// ignores the context entirely, so paying for one on every query would be
+    /// pure waste (review catch on #1893). The two cases that matter most are
+    /// the cheap ones: a ledger that never set `render_commas`, and any
+    /// human-facing surface.
+    #[test]
+    fn for_surface_borrows_unless_the_flag_must_change() {
+        use std::borrow::Cow;
+
+        let mut plain = DisplayContext::new();
+        plain.set_fixed_precision("USD", 2);
+        assert!(
+            matches!(plain.for_surface(OutputSurface::Machine), Cow::Borrowed(_)),
+            "a ledger without render_commas never needs a clone"
+        );
+
+        let mut commas = DisplayContext::new();
+        commas.set_render_commas(true);
+        assert!(
+            matches!(commas.for_surface(OutputSurface::Human), Cow::Borrowed(_)),
+            "a human surface keeps the flag, so no clone"
+        );
+        assert!(
+            matches!(commas.for_surface(OutputSurface::Machine), Cow::Owned(_)),
+            "only actually suppressing separators clones"
+        );
+    }
+
+    /// `for_surface` narrows ONLY the separator flag — precision is a property
+    /// of the data and must survive on every surface.
+    #[test]
+    fn for_surface_narrows_separators_but_keeps_precision() {
+        let mut ctx = DisplayContext::new();
+        ctx.set_render_commas(true);
+        ctx.set_fixed_precision("USD", 2);
+
+        let human = ctx.for_surface(OutputSurface::Human);
+        let machine = ctx.for_surface(OutputSurface::Machine);
+        assert!(human.render_commas());
+        assert!(!machine.render_commas());
+        assert_eq!(
+            machine.format_amount_number(rust_decimal_macros::dec!(1234.5), "USD"),
+            human
+                .format_amount_number(rust_decimal_macros::dec!(1234.5), "USD")
+                .replace(',', ""),
+            "the two differ ONLY by separators, never by precision"
+        );
+
+        // A ledger that never asked for separators is unaffected either way.
+        let mut plain = DisplayContext::new();
+        plain.set_fixed_precision("USD", 2);
+        assert!(!plain.for_surface(OutputSurface::Human).render_commas());
     }
 }
