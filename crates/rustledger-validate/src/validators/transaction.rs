@@ -340,15 +340,44 @@ pub fn validate_transaction_balance(
         return;
     }
 
+    // Same rule, other cause: a posting whose units interpolation never filled
+    // in. The residual of a half-filled transaction is an artifact of the
+    // failure, not a fact about the user's file — reporting it sends them
+    // hunting for an imbalance that would not exist once the real error is
+    // fixed.
+    //
+    // Unreachable from `rledger check`, whose pipeline books BEFORE Late
+    // validation and drops failed transactions (`run_booking`'s
+    // `failed_indices`), so every posting it sees is filled. It matters for
+    // the LSP, which collapses Early+Late into one pass and therefore does
+    // validate transactions whose booking failed: without this it reported
+    // "does not balance: residual 1e29 USD" where `check` reported that the
+    // posting amount could not be computed at all (#1863).
+    //
+    // Returning silently is right ONLY because something else has already
+    // spoken: `check` reports the booking error, and the LSP surfaces it
+    // directly (`booking_error_code`). One case is not covered — a
+    // post-booking plugin that emits a posting with no units. Nothing in-tree
+    // does, and the plugin wire format permitting it is the deeper problem,
+    // but such a transaction would now pass silently where it previously drew
+    // a (misleading) E3001. Fixing it properly means the caller telling this
+    // validator whether booking succeeded, rather than it inferring from the
+    // postings.
+    if txn.postings.iter().any(|p| p.amount().is_none()) {
+        return;
+    }
+
     // Fast path: use rust_decimal first. If ALL residuals are exactly zero,
     // the transaction definitely balances — skip the expensive BigDecimal
     // calculation. We only skip on exact zero (not "within tolerance")
     // because Decimal arithmetic can lose precision during cost/price
     // multiplication, potentially under-reporting a non-zero residual.
-    let fast_residuals = rustledger_booking::calculate_residual(txn);
-    let all_zero = fast_residuals
-        .values()
-        .all(|residual| *residual == Decimal::ZERO);
+    // `None` = the fast tier's arithmetic left `rust_decimal`'s range, so it
+    // has no opinion; fall through to the exact tier rather than skipping.
+    // Short-circuiting on `None` here would pass an arbitrarily unbalanced
+    // transaction (#1863).
+    let all_zero = rustledger_booking::calculate_residual(txn)
+        .is_some_and(|residuals| residuals.values().all(|r| *r == Decimal::ZERO));
 
     if all_zero {
         return;
@@ -431,8 +460,17 @@ pub fn update_inventories(
 
         if is_reduction {
             process_inventory_reduction(inv, posting, units, booking_method, txn, errors);
-        } else {
-            process_inventory_addition(inv, posting, units, txn);
+        } else if let Err(e) = process_inventory_addition(inv, posting, units, txn) {
+            errors.push(
+                ValidationError::new(
+                    ErrorCode::ArithmeticOverflow,
+                    rustledger_core::BookingError::Overflow(e.clone())
+                        .with_account(posting.account.clone())
+                        .to_string(),
+                    txn.date,
+                )
+                .with_context(format!("currency: {}", e.currency)),
+            );
         }
     }
 }
@@ -475,20 +513,23 @@ pub fn process_inventory_reduction(
             // On pre-booked directives, reduce() with a fully-specified cost
             // should not fail. If it does, report the error — this catches
             // bugs in the booking engine or standalone validation without booking.
-            let (code, context) = match &err {
-                rustledger_core::BookingError::InsufficientUnits { .. } => (
-                    ErrorCode::InsufficientUnits,
-                    format!("currency: {}", units.currency),
-                ),
-                rustledger_core::BookingError::AmbiguousMatch { .. } => (
-                    ErrorCode::AmbiguousLotMatch,
-                    "Specify cost, date, or label to disambiguate".to_string(),
-                ),
+            // Code from the canonical mapping (shared with the LSP); only the
+            // CONTEXT string is local, since it draws on this posting.
+            let code = ErrorCode::for_booking_error(&err);
+            let context = match &err {
+                rustledger_core::BookingError::InsufficientUnits { .. } => {
+                    format!("currency: {}", units.currency)
+                }
+                rustledger_core::BookingError::AmbiguousMatch { .. } => {
+                    "Specify cost, date, or label to disambiguate".to_string()
+                }
                 rustledger_core::BookingError::NoMatchingLot { .. }
-                | rustledger_core::BookingError::CurrencyMismatch { .. } => (
-                    ErrorCode::NoMatchingLot,
-                    format!("cost spec: {:?}", posting.cost),
-                ),
+                | rustledger_core::BookingError::CurrencyMismatch { .. } => {
+                    format!("cost spec: {:?}", posting.cost)
+                }
+                rustledger_core::BookingError::Overflow(e) => {
+                    format!("currency: {}", e.currency)
+                }
             };
             errors.push(
                 ValidationError::new(
@@ -503,15 +544,20 @@ pub fn process_inventory_reduction(
 }
 
 /// Process an inventory addition (buying/adding units).
+///
+/// # Errors
+///
+/// [`rustledger_core::OverflowError`] when the account's running total leaves
+/// `rust_decimal`'s range (#1863).
 pub fn process_inventory_addition(
     inv: &mut Inventory,
     posting: &Posting,
     units: &Amount,
     txn: &Transaction,
-) {
+) -> Result<(), rustledger_core::OverflowError> {
     let position = rustledger_core::Position::from_posting(units, posting.cost.as_ref(), txn.date);
 
-    inv.add(position);
+    inv.add(position)
 }
 
 #[cfg(test)]

@@ -483,8 +483,14 @@ include "accounts.beancount"
             if let Directive::Transaction(txn) = directive
                 && let Ok(result) = engine.book_and_interpolate(txn)
             {
-                engine.apply(&result.transaction);
-                *txn = result.transaction;
+                // This test replicates the loader's booking loop by hand;
+                // production wasm books via `helpers::load_and_book`, which
+                // goes through `rustledger_loader` and needs no change here.
+                // Skip the write-back on overflow so the loop matches what the
+                // loader does with a transaction that fails to apply (#1863).
+                if engine.apply(&result.transaction).is_ok() {
+                    *txn = result.transaction;
+                }
             }
         }
         // Sort by date for proper validation

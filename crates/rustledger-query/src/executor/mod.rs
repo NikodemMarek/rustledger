@@ -53,6 +53,18 @@ use crate::error::QueryError;
 /// both [`Executor::build_postings_table`] (the `#postings` table
 /// builder) and [`Executor::evaluate_column`] (the default-FROM column
 /// accessor) so the two paths can't drift again.
+/// The BQL-facing rendering of a `Decimal` overflow (#1863).
+///
+/// A query cell has no error code, so this carries the currency in the message
+/// instead — the same information `E4004` puts in its context field.
+fn overflow_err(currency: &rustledger_core::Currency) -> QueryError {
+    QueryError::Evaluation(format!(
+        "{currency} amount exceeds the representable range (±7.9e28); \
+         split the transaction, or denominate it in larger units \
+         (thousands, millions) so the number is smaller"
+    ))
+}
+
 pub(super) fn compute_posting_weight(posting: &rustledger_core::Posting) -> Value {
     rustledger_booking::posting_weight(posting).map_or(Value::Null, Value::Amount)
 }
@@ -524,7 +536,8 @@ impl<'a> Executor<'a> {
                                     let bal = account_balances
                                         .entry(posting.account.clone())
                                         .or_default();
-                                    bal.add(pos);
+                                    bal.add(pos)
+                                        .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                                 }
                             }
                         }
@@ -558,7 +571,8 @@ impl<'a> Executor<'a> {
                     let resolved = resolve_position(posting, txn.date);
                     if needs_account_balance && let Some(pos) = resolved.clone() {
                         let bal = account_balances.entry(posting.account.clone()).or_default();
-                        bal.add(pos);
+                        bal.add(pos)
+                            .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                     }
 
                     // Callers that only want the per-account totals (BALANCES, via
@@ -625,7 +639,9 @@ impl<'a> Executor<'a> {
                     // query doesn't read `balance`.
                     if needs_balance {
                         if let Some(pos) = resolved {
-                            cumulative_balance.add(pos);
+                            cumulative_balance
+                                .add(pos)
+                                .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                         }
                         ctx.balance = Some(cumulative_balance.clone());
                     }
@@ -825,7 +841,9 @@ impl<'a> Executor<'a> {
                         // Return inventory with just units (no cost info)
                         let mut units_inv = Inventory::new();
                         for pos in inv.positions() {
-                            units_inv.add(Position::simple(pos.units.clone()));
+                            units_inv
+                                .add(Position::simple(pos.units.clone()))
+                                .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                         }
                         Ok(Value::Inventory(Box::new(units_inv)))
                     }
@@ -841,7 +859,11 @@ impl<'a> Executor<'a> {
                     Value::Position(p) => {
                         if let Some(cost) = &p.cost {
                             // Preserve sign: buys give positive cost, sells give negative
-                            let total = p.units.number * cost.number;
+                            let total = p
+                                .units
+                                .number
+                                .checked_mul(cost.number)
+                                .ok_or_else(|| overflow_err(&cost.currency))?;
                             Ok(Value::Amount(Amount::new(total, cost.currency.clone())))
                         } else {
                             Ok(Value::Amount(p.units.clone()))
@@ -853,12 +875,19 @@ impl<'a> Executor<'a> {
                         let mut currency: Option<rustledger_core::Currency> = None;
                         for pos in inv.positions() {
                             if let Some(cost) = &pos.cost {
-                                total += pos.units.number * cost.number;
+                                total = pos
+                                    .units
+                                    .number
+                                    .checked_mul(cost.number)
+                                    .and_then(|v| total.checked_add(v))
+                                    .ok_or_else(|| overflow_err(&cost.currency))?;
                                 if currency.is_none() {
                                     currency = Some(cost.currency.clone());
                                 }
                             } else {
-                                total += pos.units.number;
+                                total = total
+                                    .checked_add(pos.units.number)
+                                    .ok_or_else(|| overflow_err(&pos.units.currency))?;
                                 if currency.is_none() {
                                     currency = Some(pos.units.currency.clone());
                                 }
@@ -1162,7 +1191,9 @@ impl<'a> Executor<'a> {
                             .collect();
                         let mut new_inv = Inventory::new();
                         for pos in filtered {
-                            new_inv.add(pos);
+                            new_inv
+                                .add(pos)
+                                .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                         }
                         Ok(Value::Inventory(Box::new(new_inv)))
                     }
@@ -1289,12 +1320,18 @@ impl<'a> Executor<'a> {
                         let mut result = Inventory::default();
                         for pos in inv.positions() {
                             if pos.units.currency == target_currency {
-                                result.add(Position::simple(pos.units.clone()));
+                                result
+                                    .add(Position::simple(pos.units.clone()))
+                                    .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             } else if let Some(converted) = convert_amount(&pos.units) {
-                                result.add(Position::simple(converted));
+                                result
+                                    .add(Position::simple(converted))
+                                    .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             } else {
                                 // No conversion available - keep original (Python beancount behavior)
-                                result.add(Position::simple(pos.units.clone()));
+                                result
+                                    .add(Position::simple(pos.units.clone()))
+                                    .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             }
                         }
                         // If result has single currency matching target, return as Amount
@@ -1491,13 +1528,26 @@ impl<'a> Executor<'a> {
                         let mut result = Inventory::new();
                         for pos in inv.positions() {
                             if let Some(cost) = &pos.cost {
-                                let total = pos.units.number * cost.number;
-                                result.add(Position::simple(Amount::new(
-                                    total,
-                                    cost.currency.clone(),
-                                )));
+                                // Checked: `units * cost` leaves range on
+                                // inputs well below the ceiling (#1863).
+                                let total =
+                                    pos.units.number.checked_mul(cost.number).ok_or_else(|| {
+                                        QueryError::Evaluation(format!(
+                                            "{} cost basis exceeds the representable range \
+                                             (±7.9e28)",
+                                            cost.currency
+                                        ))
+                                    })?;
+                                result
+                                    .add(Position::simple(Amount::new(
+                                        total,
+                                        cost.currency.clone(),
+                                    )))
+                                    .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             } else {
-                                result.add(Position::simple(pos.units.clone()));
+                                result
+                                    .add(Position::simple(pos.units.clone()))
+                                    .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             }
                         }
                         Ok(Value::Inventory(Box::new(result)))
@@ -1866,7 +1916,8 @@ impl<'a> Executor<'a> {
                         } else {
                             pos.units.clone()
                         };
-                        out.add(rustledger_core::Position::simple(units));
+                        out.add(rustledger_core::Position::simple(units))
+                            .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                     }
                     return Ok(Value::Inventory(Box::new(out)));
                 }
