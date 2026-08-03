@@ -39,3 +39,136 @@ fn fuzz_green_eq_red_compound_cost_unparsable_number() {
         "green-wired parse must exactly match red-only parse"
     );
 }
+
+/// #1939: arithmetic inside a COST SPEC was truncated to its first operand.
+///
+/// The price path has always evaluated expressions; the cost path latched the
+/// first `NUMBER` token and dropped the rest, so `{10.00 * 3 USD}` booked a
+/// cost of `10.00`. That is a wrong cost basis, and because the weight follows
+/// the cost it also produced a FALSE "does not balance" on a file beancount
+/// accepts.
+///
+/// Asserted on the units the user can observe (the resolved cost number), not
+/// on a substring of the debug output — a bare `contains("30.00")` would be
+/// satisfied by the price, which is `20.00 * 2` and also renders `40.00`.
+#[test]
+fn cost_spec_arithmetic_is_evaluated() {
+    let src = "2013-05-18 * \"t\"\n  Assets:A   2 HOOL {10.00 * 3 USD}\n  Assets:B  -60.00 USD\n";
+    let parsed = rustledger_parser::parse(src);
+    let mut seen = 0;
+    for d in &parsed.directives {
+        if let rustledger_core::Directive::Transaction(t) = &**d {
+            for p in &t.postings {
+                if let Some(cs) = &p.cost {
+                    seen += 1;
+                    // The typed accessor, not a Debug string: the value is the
+                    // claim, and coupling to formatting makes the test fail for
+                    // reasons that are not about cost bases.
+                    assert_eq!(
+                        cs.number
+                            .as_ref()
+                            .and_then(rustledger_core::CostNumber::per_unit),
+                        Some(rust_decimal_macros::dec!(30.00)),
+                        "cost spec arithmetic must be evaluated, not truncated",
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(seen, 1, "fixture must actually exercise one cost spec");
+}
+
+/// The same expression must evaluate identically on BOTH conversion paths.
+///
+/// Every historical cost-spec divergence (#1704, #1713, the `{*}` merge flag)
+/// landed in a hand-mirrored copy of these semantics, so a fix that touches
+/// cost-spec numbers is exactly the shape that drifts. This is cheap insurance
+/// that the shared `cost_spec_from_tokens` really is shared.
+#[test]
+fn cost_spec_arithmetic_green_eq_red() {
+    for src in [
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {10.00 * 3 USD}\n  Assets:B  -60.00 USD\n",
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {(1 + 2) * 5 USD}\n  Assets:B  -30.00 USD\n",
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {10.00 USD, 2014-02-25}\n  Assets:B  -20.00 USD\n",
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {3 # 2 * 10 USD}\n  Assets:B  -26.00 USD\n",
+        // Malformed: must degrade the same way on both paths, not just fail
+        // the same way by accident on one.
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {10.00 * USD}\n  Assets:B  -20.00 USD\n",
+        "2013-05-18 * \"t\"\n  Assets:A  2 HOOL {1 / 0 USD}\n  Assets:B  -20.00 USD\n",
+    ] {
+        let green = rustledger_parser::parse(src);
+        let red = rustledger_parser::cst::parse_red_only(src);
+        assert_eq!(
+            format!("{:?}", green.directives),
+            format!("{:?}", red.directives),
+            "green and red must agree on cost-spec arithmetic for: {src}",
+        );
+    }
+}
+
+/// A NEGATIVE cost kept its sign only by accident before #1939, and did not.
+///
+/// This was NOT the bug being hunted — it surfaced as unexplained corpus
+/// baseline drift on two `TotalsAndSigns` fixtures while fixing the arithmetic
+/// truncation, and turned out to be the same root cause wearing a different
+/// hat. `{-200.00 USD}` starts with a `MINUS`, which the token latch never
+/// treated as part of the number, so the cost was booked as **+200.00**: the
+/// sign of a cost basis, silently inverted. Routing it through the shared
+/// evaluator (which handles unary minus) fixes it, and both fixtures now agree
+/// with beancount exactly.
+///
+/// Kept as its own test because "arithmetic is evaluated" and "a leading sign
+/// is part of the number" are different claims, and a future refactor could
+/// easily satisfy one while breaking the other.
+#[test]
+fn negative_cost_keeps_its_sign() {
+    use rust_decimal_macros::dec;
+    use rustledger_core::CostNumber;
+
+    // Matched structurally rather than via Debug strings. `Compound` carries
+    // BOTH halves and neither `per_unit()` nor `total()` can express it (both
+    // return None by design, since the effective per-unit is unknown until the
+    // units are), so a typed accessor alone cannot state this claim.
+    let parsed = rustledger_parser::parse(
+        "2013-05-18 * \"t\"\n  Assets:A  -10 MSFT {-200.00 USD}\n  Assets:B  2000.00 USD\n",
+    );
+    let mut seen = 0;
+    for d in &parsed.directives {
+        if let rustledger_core::Directive::Transaction(t) = &**d {
+            for p in &t.postings {
+                if let Some(cs) = &p.cost {
+                    seen += 1;
+                    assert!(
+                        matches!(cs.number, Some(CostNumber::PerUnit { value }) if value == dec!(-200.00)),
+                        "a negative per-unit cost must keep its sign, got {:?}",
+                        cs.number,
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(seen, 1, "fixture must exercise exactly one cost spec");
+
+    let parsed = rustledger_parser::parse(
+        "2013-05-18 * \"t\"\n  Assets:A  -10 MSFT {# -200.00 USD}\n  Assets:B  200.00 USD\n",
+    );
+    let mut seen = 0;
+    for d in &parsed.directives {
+        if let rustledger_core::Directive::Transaction(t) = &**d {
+            for p in &t.postings {
+                if let Some(cs) = &p.cost {
+                    seen += 1;
+                    assert!(
+                        matches!(
+                            cs.number,
+                            Some(CostNumber::Compound { total, .. }) if total == dec!(-200.00)
+                        ),
+                        "a negative TOTAL cost must keep its sign, got {:?}",
+                        cs.number,
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(seen, 1, "fixture must exercise exactly one cost spec");
+}
