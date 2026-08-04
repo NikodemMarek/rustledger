@@ -288,10 +288,25 @@ KNOWN_POSTING_DIVERGENCES: dict[tuple[str, str], str] = {
     ("test-cases_ParseLots.CostTotalEmptyTotal.beancount", "cost_number"):
         "compound `#` cost: we honor the written number, beancount solves from "
         "the residual (#1943, deliberate)",
+    # `HOOL {300.00 USD}` with the UNITS elided: both tools interpolate 2 units
+    # at a cost of 300.00, but beancount leaves the lot DATE unset while we set
+    # the transaction date.
+    #
+    # That is an inconsistency on beancount's side, not a rule: with the units
+    # written out it sets `date=2010-05-28` for the very same cost, and only
+    # the units-missing interpolation path drops it. A `Cost` with no date
+    # cannot be matched by lot date afterwards, so filling it is the behavior
+    # that keeps booking usable. Ours is deliberate; pinned rather than
+    # "fixed", because matching beancount here would mean producing a lot we
+    # cannot later identify.
+    ("test-cases_IncompleteInputs.UnitsMissingNumberWithCost.beancount", "cost_date"):
+        "beancount omits the lot date only when units are elided; we set it "
+        "consistently (deliberate)",
     # NOT pinned on purpose:
-    #   - `UnitsMissingNumberWithCost` cost_date, and `ZeroPrices` — unexamined
-    #     beyond first triage, so pinning them would be asserting a conclusion
-    #     nobody has reached.
+    #   (nothing right now — every finding the corpus produces is either
+    #   pinned above with a reason or has been fixed. `ZeroPrices` used to sit
+    #   here and turned out to be a bug in THIS script, not a divergence: a
+    #   zero price is falsy in beancount, so `if amount` read it as absent.)
 }
 
 
@@ -346,7 +361,14 @@ def beancount_postings(path: Path):
                 str(e.date), p.account, p.units.number, p.units.currency,
                 getattr(c, "number", None), getattr(c, "currency", None),
                 str(c.date) if getattr(c, "date", None) else None,
-                pr.number if pr else None, pr.currency if pr else None,
+                # `is not None`, NOT truthiness: beancount's `Amount` defines
+                # `__bool__` from its NUMBER, so `bool(Amount(0, "XFER"))` is
+                # False and a zero price read as NO price. That produced a
+                # phantom divergence on `Transactions.ZeroPrices` — reported as
+                # beancount=None vs rledger=0, when both in fact keep `0 XFER`.
+                # The harness was wrong, not rledger.
+                pr.number if pr is not None else None,
+                pr.currency if pr is not None else None,
             ))
     return sorted(rows, key=_row_sort_key)
 
@@ -676,6 +698,48 @@ def self_test(binary: str) -> int:
         same = _decimal_sort_token(Decimal(a)) == _decimal_sort_token(Decimal(b))
         check(same == want_same,
               f"sort token for {a} vs {b}: same={same}, expected {want_same}")
+
+    # --- falsy-but-present values -----------------------------------------
+    # A zero price is PRESENT. beancount's `Amount.__bool__` reads its number,
+    # so `if amount` is False for `0 XFER` and an earlier version of this
+    # harness reported a phantom divergence on `Transactions.ZeroPrices`.
+    # Asserted here because the fix is a one-character habit (`is not None`)
+    # that is easy to undo without noticing.
+    zero_price = (
+        "2014-04-20", "Equity:C", Decimal("100"), "USD",
+        None, None, None, Decimal("0"), "XFER",
+    )
+    no_price = (
+        "2014-04-20", "Equity:C", Decimal("100"), "USD",
+        None, None, None, None, None,
+    )
+    check(compare_postings([zero_price], [zero_price]) == [],
+          "a zero price must compare equal to itself")
+    check(compare_postings([zero_price], [no_price]) != [],
+          "a ZERO price and NO price must not be treated as the same thing")
+
+    # ...and END TO END, through the extractor where the bug actually was.
+    # The two checks above exercise `compare_postings`, but the defect lived in
+    # `beancount_postings`: `pr.number if pr else None` against an `Amount`
+    # whose `__bool__` reads its number. Reverting that line would leave the
+    # checks above passing, so on their own they guard the wrong function —
+    # which is the failure this whole self-test exists to prevent.
+    with tempfile.TemporaryDirectory() as td:
+        zp = Path(td) / "zero_price.beancount"
+        zp.write_text(
+            "2014-01-01 open Equity:C\n"
+            "2014-04-20 *\n"
+            "  Equity:C   100 USD @ 0 XFER\n"
+            "  Equity:C  -100 USD\n"
+        )
+        rows = beancount_postings(zp)
+        check(rows is not None, "the zero-price fixture must be comparable at all")
+        if rows:
+            priced = [r for r in rows if r[7] is not None or r[8] is not None]
+            check(
+                len(priced) == 1 and priced[0][7] == Decimal("0") and priced[0][8] == "XFER",
+                f"a zero price must survive extraction as 0 XFER, got {[(r[7], r[8]) for r in rows]}",
+            )
 
     for f in failures:
         print(f"SELF-TEST FAILED: {f}")
