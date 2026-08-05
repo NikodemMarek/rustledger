@@ -65,6 +65,37 @@ fn overflow_err(currency: &rustledger_core::Currency) -> QueryError {
     ))
 }
 
+/// `units x per-unit cost`, with the scale the multiplication invents stripped
+/// (#1963).
+///
+/// ONE implementation, because `WEIGHT()` reaches this arithmetic down two
+/// paths — a bare `Position` and every position inside an `Inventory` — and the
+/// first fix for #1963 patched only the first. The two then disagreed with each
+/// other as well as with the column: `WEIGHT(position)` gave `100` where
+/// `WEIGHT(SUM(position))` still gave `100.00000000000000000000000000`.
+///
+/// Why the arithmetic is re-derived here at all, why the strip is conditional,
+/// and what it still does not recover are documented at the `WEIGHT` arm.
+fn position_cost_total(units: &Amount, cost: &rustledger_core::Cost) -> Result<Amount, QueryError> {
+    /// Past any scale a cost is plausibly WRITTEN with. A heuristic, not an
+    /// invariant - see the `WEIGHT` arm.
+    const ARTIFACT_SCALE: u32 = 12;
+
+    // `checked_mul`, matching the `COST` arm. A saturating or wrapping product
+    // would certify a weight that never existed - the unsoundness #1863
+    // removed from the residual path.
+    let raw = units
+        .number
+        .checked_mul(cost.number)
+        .ok_or_else(|| overflow_err(&cost.currency))?;
+    let total = if raw.scale() > ARTIFACT_SCALE {
+        raw.normalize()
+    } else {
+        raw
+    };
+    Ok(Amount::new(total, cost.currency.clone()))
+}
+
 pub(super) fn compute_posting_weight(posting: &rustledger_core::Posting) -> Value {
     rustledger_booking::posting_weight(posting).map_or(Value::Null, Value::Amount)
 }
@@ -1517,8 +1548,51 @@ impl<'a> Executor<'a> {
                 match &args[0] {
                     Value::Position(p) => {
                         if let Some(cost) = &p.cost {
-                            let total = p.units.number * cost.number;
-                            Ok(Value::Amount(Amount::new(total, cost.currency.clone())))
+                            // `units x per-unit`, normalized (#1963).
+                            //
+                            // This CANNOT call `rustledger_booking::posting_weight`
+                            // like the `weight` COLUMN does: that takes a
+                            // `Posting`, whose `CostSpec` still carries the
+                            // preserved total for `Total`/`PerUnitFromTotal`,
+                            // while a `Position`'s cost is already resolved to a
+                            // per-unit `Decimal`. The total is gone by the time
+                            // this function sees it, and `evaluate_function_on_values`
+                            // receives only `Value`s — no posting to recover it from.
+                            //
+                            // Recomputing therefore reintroduces exactly the
+                            // division-then-multiplication the canonical exists to
+                            // avoid (#1106/#1113). `3 HOOL {{100.00 USD}}` resolves
+                            // to a per-unit of 33.333..., and multiplying back gave
+                            // `100.00000000000000000000000000` where the column
+                            // gives `100.00` — the same value with 26 digits of
+                            // scale invented by the multiplication.
+                            //
+                            // The mitigation is deliberately narrow. Normalizing
+                            // unconditionally was tried first and is WORSE: it also
+                            // strips MEANINGFUL trailing zeros, turning the ordinary
+                            // `2 HOOL {5.25 USD}` weight from `10.50` into `10.5`
+                            // and regressing the common case to paper over the rare
+                            // one. So the strip applies only when the scale is
+                            // already past anything a cost is plausibly WRITTEN
+                            // with. That is a heuristic, not an invariant:
+                            // `rust_decimal` accepts literals out to 28 places, so
+                            // a user could author a 13-place cost and see its
+                            // weight normalized. No real currency is quoted that
+                            // finely, and the alternative — touching every weight —
+                            // is the regression described above.
+                            //
+                            // It does NOT recover the original scale: this yields
+                            // `100` where the column yields `100.00`. Closing that
+                            // gap needs `Position` to retain the cost spec (or this
+                            // function to receive the `Posting`), which is a wider
+                            // change than the symptom warrants and is recorded on
+                            // the issue.
+                            //
+                            // `WEIGHT()` is a rustledger extension — beanquery has
+                            // no `weight(position)` function — so there is no
+                            // reference implementation to match here, only the
+                            // column to stay consistent with.
+                            Ok(Value::Amount(position_cost_total(&p.units, cost)?))
                         } else {
                             Ok(Value::Amount(p.units.clone()))
                         }
@@ -1528,21 +1602,8 @@ impl<'a> Executor<'a> {
                         let mut result = Inventory::new();
                         for pos in inv.positions() {
                             if let Some(cost) = &pos.cost {
-                                // Checked: `units * cost` leaves range on
-                                // inputs well below the ceiling (#1863).
-                                let total =
-                                    pos.units.number.checked_mul(cost.number).ok_or_else(|| {
-                                        QueryError::Evaluation(format!(
-                                            "{} cost basis exceeds the representable range \
-                                             (±7.9e28)",
-                                            cost.currency
-                                        ))
-                                    })?;
                                 result
-                                    .add(Position::simple(Amount::new(
-                                        total,
-                                        cost.currency.clone(),
-                                    )))
+                                    .add(Position::simple(position_cost_total(&pos.units, cost)?))
                                     .map_err(|e| QueryError::Evaluation(e.to_string()))?;
                             } else {
                                 result
