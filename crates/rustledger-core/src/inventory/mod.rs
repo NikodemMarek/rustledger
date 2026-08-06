@@ -347,6 +347,22 @@ impl std::error::Error for AccountedBookingError {}
 /// assert_eq!(inv.units("AAPL"), dec!(10));
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// Deserialization goes through `InventoryWire` so the derived caches are
+// REBUILT rather than left empty.
+//
+// `simple_index` and `units_cache` are `#[serde(skip)]`, so a plain derive
+// produced an inventory holding positions with both caches empty. `units()`
+// recomputes on a miss and `add_headroom_for` refuses to answer, but `add()`
+// trusted them: `units_cache.get(..).unwrap_or_default()` read 0 for an
+// inventory already holding 100 USD, then wrote that back as the new total,
+// while the empty `simple_index` meant a cost-less lot was appended instead of
+// merged. A round-tripped 100 USD inventory answered `units("USD") == 5` after
+// adding 5, with two lots where there should be one.
+//
+// `rebuild_index`'s own doc already claimed it ran "after ... deserialization".
+// It did not — nothing called it on that path, and two comments elsewhere
+// referred to it by a name (`rebuild_caches`) that never existed. Now it does.
+#[serde(try_from = "InventoryWire")]
 pub struct Inventory {
     /// Persistent (structurally-shared) RRB-tree-backed vector. Cloning
     /// is O(1) (Arc bump on the tree root); `push_back` / indexed mutation
@@ -381,6 +397,62 @@ pub struct Inventory {
     /// Not serialized - rebuilt on demand.
     #[serde(skip)]
     units_cache: FxHashMap<crate::Currency, Decimal>,
+}
+
+/// Where the positions a cache rebuild is reading came from.
+///
+/// Only affects whether the one-cost-less-lot-per-currency invariant is
+/// ASSERTED. It is a genuine invariant of positions this type built, and a
+/// `debug_assert` there earns its keep as an internal-bug tripwire — but a
+/// deserialized payload is input, and input must not be able to panic us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheSource {
+    /// Positions this inventory produced; the invariant holds.
+    Internal,
+    /// Positions from outside — a deserialized payload.
+    Untrusted,
+}
+
+/// Deserialization shape for [`Inventory`]: the persisted field only.
+///
+/// Exists so `From` can rebuild the derived caches — see the note on
+/// `Inventory`. Kept private; the wire format is unchanged (a struct with a
+/// `positions` sequence), so this is not a compatibility break.
+#[derive(Deserialize)]
+struct InventoryWire {
+    // NOT `#[serde(default)]`. The derive this replaces made `positions`
+    // required, so `{}` was `Err("missing field `positions`")`; defaulting it
+    // would quietly accept a malformed payload as an empty inventory.
+    positions: Vector<Position>,
+}
+
+impl TryFrom<InventoryWire> for Inventory {
+    type Error = OverflowError;
+
+    /// `TryFrom`, not `From`: rebuilding the caches sums a currency's positions,
+    /// and that sum can overflow on a payload nobody sane wrote.
+    ///
+    /// `rebuild_index` accumulates with `+=`, which PANICS on `Decimal`
+    /// overflow — so two `Decimal::MAX` USD lots aborted inside `Deserialize`
+    /// with "Addition overflowed" rather than returning a serde error. Review
+    /// catch; a deserialization boundary must not panic on its input, the same
+    /// rule that applies to the parser. The rebuild now uses `checked_add` and
+    /// the failure arrives as `Err`, which serde reports as a normal
+    /// deserialization error.
+    fn try_from(wire: InventoryWire) -> Result<Self, Self::Error> {
+        let mut inv = Self {
+            positions: wire.positions,
+            simple_index: FxHashMap::default(),
+            units_cache: FxHashMap::default(),
+        };
+        // UNTRUSTED: the payload is input, not something this type produced, so
+        // it may carry two cost-less lots for one currency — a state the
+        // invariant forbids. `rebuild_index`'s `debug_assert` is there to catch
+        // an internal bug; reaching it from deserialization would turn a
+        // malformed document into a panic at the boundary.
+        inv.try_rebuild_index_from(CacheSource::Untrusted)?;
+        Ok(inv)
+    }
 }
 
 impl PartialEq for Inventory {
@@ -777,28 +849,58 @@ impl Inventory {
     }
 
     /// Rebuild all caches (`simple_index` and `units_cache`) from positions.
-    /// Called after operations that may invalidate caches (like retain or deserialization).
+    ///
+    /// Called after operations that may invalidate them (`compact`'s retain) and
+    /// on deserialization, which is what [`CacheSource`] distinguishes.
     fn rebuild_index(&mut self) {
+        // Internal positions came through `add`, which already rejected any
+        // sum that would overflow, so this cannot fail. Asserted rather than
+        // ignored: a failure here would mean `add`'s check had a hole.
+        // Call FIRST, assert on the result. Putting the call inside
+        // `debug_assert!` compiles the rebuild itself out of release builds,
+        // so `compact` would have left the caches stale — caught by clippy's
+        // `debug_assert_with_mut_call`.
+        let rebuilt = self.try_rebuild_index_from(CacheSource::Internal);
+        debug_assert!(
+            rebuilt.is_ok(),
+            "internal positions summed past the Decimal range; `add` should \
+             have rejected them",
+        );
+    }
+
+    fn try_rebuild_index_from(&mut self, source: CacheSource) -> Result<(), OverflowError> {
         self.simple_index.clear();
         self.units_cache.clear();
 
         for (idx, pos) in self.positions.iter().enumerate() {
-            // Update units cache for all positions
-            *self
+            // Update units cache for all positions. `checked_add`, not `+=`:
+            // `Decimal`'s `+` panics on overflow, and this runs over payloads.
+            let slot = self
                 .units_cache
                 .entry(pos.units.currency.clone())
-                .or_default() += pos.units.number;
+                .or_default();
+            *slot = slot
+                .checked_add(pos.units.number)
+                .ok_or_else(|| OverflowError {
+                    currency: pos.units.currency.clone(),
+                })?;
 
             // Update simple_index only for positions without cost
             if pos.cost.is_none() {
                 debug_assert!(
-                    !self.simple_index.contains_key(&pos.units.currency),
+                    source == CacheSource::Untrusted
+                        || !self.simple_index.contains_key(&pos.units.currency),
                     "Invariant violated: multiple simple positions for currency {}",
                     pos.units.currency
                 );
+                // Last-wins on a duplicate, matching the pre-existing behavior
+                // of this insert. `units_cache` sums every position either way,
+                // so the total stays right; only which lot a later cost-less
+                // `add` merges into is affected.
                 self.simple_index.insert(pos.units.currency.clone(), idx);
             }
         }
+        Ok(())
     }
 
     /// Merge this inventory with another.
@@ -973,14 +1075,15 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
 
-    /// A deserialized inventory, whose caches are empty until rebuilt, must
-    /// not be reported as having headroom it does not have.
+    /// A deserialized inventory must not be reported as having headroom it
+    /// does not have.
     ///
-    /// `units_cache` and `simple_index` are `#[serde(skip)]`, so a round-trip
-    /// leaves `positions` populated and both caches empty. Reading them in that
-    /// state answers "plenty of room" for an inventory parked at the ceiling.
-    /// An unsound `true` makes `apply` skip the snapshot it needed, so this is
-    /// silent corruption rather than a wrong number (review catch on #1898).
+    /// The caches are `#[serde(skip)]`, so a round-trip once left `positions`
+    /// populated and both caches empty. Deserialization now rebuilds them, so
+    /// this passes because the cache is CORRECT rather than because
+    /// `add_headroom_for` refuses to read an empty one. Both are checked: the
+    /// defensive refusal stays as the second line of defense for any other way
+    /// an inventory might reach that state (review catch on #1898).
     #[test]
     fn a_deserialized_inventory_refuses_to_claim_headroom() {
         let mut inv = Inventory::new();
@@ -992,21 +1095,138 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&inv).expect("serialize"))
                 .expect("deserialize");
 
-        // Precondition: this really is the caches-empty state, so the test
-        // cannot pass vacuously on an inventory that rebuilt them itself.
         assert!(
             !round_tripped.positions.is_empty(),
             "the positions survive the round-trip"
         );
         assert!(
-            round_tripped.units_cache.is_empty(),
-            "...and the caches do not — that is what makes this dangerous"
+            !round_tripped.units_cache.is_empty(),
+            "and so do the caches now — deserialization rebuilds them"
         );
 
         assert!(
             !round_tripped.add_headroom_for("USD", Decimal::ONE),
-            "the inventory still holds Decimal::MAX; an empty cache is \
-             'cannot prove', never 'plenty of room'"
+            "the inventory still holds Decimal::MAX"
+        );
+    }
+
+    /// A payload the type could not have produced must not panic us.
+    ///
+    /// Two cost-less lots for one currency violate the invariant
+    /// `rebuild_index` asserts. That assert is a worthwhile internal-bug
+    /// tripwire, but rebuilding on deserialization put it in reach of INPUT:
+    /// this exact document panicked a debug build with "Invariant violated:
+    /// multiple simple positions for currency USD". Caught reviewing the
+    /// rebuild change, not present before it.
+    ///
+    /// Behavior matches what the plain derive did — the total is the sum, the
+    /// lots are preserved — so nothing about malformed input changed except
+    /// that the caches are now correct for it.
+    #[test]
+    fn a_payload_violating_the_lot_invariant_does_not_panic() {
+        let json = r#"{"positions":[
+            {"units":{"number":"100","currency":"USD"},"cost":null},
+            {"units":{"number":"5","currency":"USD"},"cost":null}]}"#;
+        let inv: Inventory = serde_json::from_str(json).expect("malformed input still loads");
+        assert_eq!(inv.units("USD"), dec!(105), "the total sums every lot");
+        assert_eq!(
+            inv.positions().count(),
+            2,
+            "the lots are preserved as given"
+        );
+    }
+
+    /// A payload whose positions sum past the `Decimal` range is an ERROR,
+    /// not a panic.
+    ///
+    /// Rebuilding the caches sums each currency's positions, and the rebuild
+    /// used `+=`, which panics on `Decimal` overflow. Running it on
+    /// deserialization put that inside `Deserialize`: two `Decimal::MAX` USD
+    /// lots aborted with "Addition overflowed" instead of returning a serde
+    /// error — a denial of service on any embedder deserializing untrusted input. Review
+    /// catch on the rebuild change; the deep review that found the
+    /// `debug_assert` panic missed this second one.
+    ///
+    /// Two lots are needed, and the first must carry a cost: a second cost-less
+    /// lot for the same currency would be a different (also-tested) malformed
+    /// shape, and the sum is what is being exercised here.
+    #[test]
+    fn a_payload_that_overflows_the_total_is_an_error_not_a_panic() {
+        let max = Decimal::MAX.to_string();
+        let json = format!(
+            r#"{{"positions":[
+                {{"units":{{"number":"{max}","currency":"USD"}},
+                  "cost":{{"number":"1","currency":"EUR","date":null,"label":null}}}},
+                {{"units":{{"number":"{max}","currency":"USD"}},"cost":null}}]}}"#
+        );
+        let err = serde_json::from_str::<Inventory>(&json)
+            .expect_err("a total past the Decimal range cannot be represented");
+        // `OverflowError`'s own wording, which serde surfaces verbatim — so
+        // this also pins that the error reaching the caller is the domain one
+        // rather than a generic "invalid value".
+        assert!(
+            err.to_string().contains("exceeds the representable range"),
+            "expected the USD overflow error, got: {err}",
+        );
+    }
+
+    /// `positions` stays REQUIRED.
+    ///
+    /// The derive this replaced made it so, and routing deserialization through
+    /// a wire struct is exactly the kind of change that silently relaxes it —
+    /// a stray `#[serde(default)]` turns a malformed document into an empty
+    /// inventory. It did, in the first draft of this change.
+    #[test]
+    fn a_payload_without_positions_is_rejected() {
+        let err = serde_json::from_str::<Inventory>("{}")
+            .expect_err("an inventory without positions is malformed");
+        assert!(
+            err.to_string().contains("missing field"),
+            "expected a missing-field error, got: {err}",
+        );
+    }
+
+    /// Mutating a deserialized inventory must not corrupt it.
+    ///
+    /// This is the case the rebuild exists for. `add` trusts both caches: it
+    /// reads `units_cache.get(..).unwrap_or_default()` as the running total and
+    /// `simple_index` as the lot to merge into. With both empty it read 0 for an
+    /// inventory already holding 100 USD, wrote that back as the new total, and
+    /// appended a second cost-less USD lot instead of merging — so a round-tripped
+    /// 100 USD inventory answered `units("USD") == 5` after adding 5, holding two
+    /// lots where the type's own invariant allows one.
+    ///
+    /// `units()` and `add_headroom_for` both survived that state on their own —
+    /// one recomputes, the other refuses — which is exactly why it went
+    /// unnoticed: the read paths were guarded and the WRITE path was not.
+    #[test]
+    fn adding_to_a_deserialized_inventory_keeps_the_running_total() {
+        let mut inv = Inventory::new();
+        inv.add(Position::simple(Amount::new(dec!(100), "USD")))
+            .expect("fits");
+
+        let mut round_tripped: Inventory =
+            serde_json::from_str(&serde_json::to_string(&inv).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(
+            round_tripped.units("USD"),
+            dec!(100),
+            "the round-trip preserves the total"
+        );
+
+        round_tripped
+            .add(Position::simple(Amount::new(dec!(5), "USD")))
+            .expect("fits");
+
+        assert_eq!(
+            round_tripped.units("USD"),
+            dec!(105),
+            "add must extend the existing total, not replace it"
+        );
+        assert_eq!(
+            round_tripped.positions().count(),
+            1,
+            "a cost-less add merges into the existing lot rather than appending"
         );
     }
 
