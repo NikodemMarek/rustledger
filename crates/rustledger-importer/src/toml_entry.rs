@@ -79,6 +79,44 @@ pub struct ImporterEntry {
     pub mappings: HashMap<String, String>,
     /// Categorize via the built-in merchant dictionary (off by default).
     pub use_merchant_dict: Option<bool>,
+    /// External preprocessing command (argv array). When set, the command
+    /// runs BEFORE format detection and extraction: any `{input}` argument
+    /// is replaced by the statement's path, stdout becomes the content the
+    /// rest of the pipeline (inference, column mapping) consumes. This is
+    /// how PDF and other unsupported formats import today, until a native
+    /// parser exists.
+    ///
+    /// This is an ARGV ARRAY, not a shell command line: there is no shell, so
+    /// `|`, `>` and `&&` are ordinary arguments rather than operators. A
+    /// single program:
+    ///
+    /// ```toml
+    /// preprocess = ["pdftotext", "-layout", "{input}", "-"]
+    /// ```
+    ///
+    /// A pipeline needs a shell, asked for explicitly — and the path goes in
+    /// as a POSITIONAL argument, never spliced into the command string:
+    ///
+    /// ```toml
+    /// preprocess = ["sh", "-c", "pdftotext -layout \"$1\" - | to-csv", "_", "{input}"]
+    /// ```
+    ///
+    /// `sh -c` parses its argument as source, so a `{input}` written inside it
+    /// would let a filename become code: `a;rm -rf ~;b.pdf` is three commands.
+    /// The filename is not the config author's — importing files you
+    /// downloaded is the point — so the CLI REJECTS that shape. `{input}` as
+    /// its own argv element is always safe; a shell never re-parses `$1`.
+    ///
+    /// **Trust model**: this executes a program named by the config, so the
+    /// CLI honors it only when the config is yours — passed with `--config`,
+    /// or in your user config directory. A `./importers.toml` picked up from
+    /// the current directory is IGNORED for this field, with a warning,
+    /// because that file belongs to whoever put it there rather than to you.
+    /// Honored by the CLI only; the WASI component cannot exec and rejects
+    /// entries that set it (the host runs the preprocessor and passes its
+    /// output as content instead).
+    #[serde(default)]
+    pub preprocess: Option<Vec<String>>,
 }
 
 impl ImporterEntry {
@@ -419,6 +457,25 @@ amount_column = 2
             Some("2".to_string())
         );
         build_config_from_entry(&entry).expect("config builds");
+    }
+
+    #[test]
+    fn preprocess_parses_as_argv() {
+        let entry = ImporterEntry::from_toml_str(
+            "name = \"pdf\"\npreprocess = [\"pdftotext\", \"-layout\", \"{input}\", \"-\"]",
+        )
+        .expect("parses");
+        assert_eq!(
+            entry.preprocess.as_deref(),
+            Some(
+                &[
+                    "pdftotext".to_string(),
+                    "-layout".into(),
+                    "{input}".into(),
+                    "-".into()
+                ][..]
+            )
+        );
     }
 
     #[test]

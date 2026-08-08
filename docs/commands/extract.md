@@ -254,6 +254,69 @@ rledger extract statement.csv \
   --invert-sign
 ```
 
+## External Preprocessing (PDF and other formats)
+
+An importer entry can declare a `preprocess` command — an argv array run
+before format detection and extraction. Any `{input}` argument is replaced
+with the statement's path; the command's stdout becomes the content the
+rest of the pipeline (auto-inference, column mapping, categorization)
+consumes. This is how PDF statements import today, until a native parser
+exists:
+
+```toml
+[[importers]]
+name = "mybank-pdf"
+filename_pattern = "*.pdf"
+account = "Assets:Checking"
+# pdftotext's -layout output piped through a small table-to-CSV script.
+# Note the path goes in as a positional ("$1"), NOT spliced into the string:
+preprocess = ["sh", "-c", "pdftotext -layout \"$1\" - | mybank-table-to-csv", "_", "{input}"]
+date_column = "Date"
+narration_column = "Description"
+amount_column = "Amount"
+```
+
+The command runs with the CLI only — the WASI component cannot exec and
+rejects entries that set `preprocess` (a GUI host runs the preprocessor
+itself and passes the output as content).
+
+**Trust model**: `preprocess` executes a program named by the config, so it
+is honored only when the config is yours:
+
+| where the config came from | `preprocess` |
+|---|---|
+| `--config path/to/importers.toml` | runs |
+| `~/.config/rledger/importers.toml` | runs |
+| `./importers.toml`, found by looking around | **ignored, with a warning** |
+
+The last row is the point. Without it, `rledger extract statement.csv` would
+execute whatever an `importers.toml` in the current directory says — an
+unzipped statement bundle, a cloned repo, a shared downloads folder — because
+of where your terminal happened to be. The entry still works for declaring
+columns; only the command is withheld. Pass it with `--config` if it really is
+yours.
+
+### `{input}` and shells
+
+`{input}` is substituted by plain text replacement, so **where** you put it
+decides whether a filename can become code:
+
+| form | safe? | why |
+|---|---|---|
+| `["pdftotext", "-layout", "{input}", "-"]` | ✅ | no shell; the path is one argv element whatever it contains |
+| `["sh", "-c", "… \"$1\" …", "_", "{input}"]` | ✅ | the path arrives in `$1`, which the shell does not re-parse |
+| `["sh", "-c", "… {input} …"]` | ❌ **rejected** | `sh -c` parses its argument as source, so `a;rm -rf ~;b.pdf` runs `rm` |
+
+The trust model above is about the *config*. The **filename is a separate
+untrusted input** — importing files you downloaded is the entire point of this
+feature — so a config you wrote yourself is not enough to make the third row
+safe. `rledger extract ~/Downloads/*.pdf` would be arbitrary code execution.
+The CLI refuses that shape and tells you the positional rewrite.
+
+Only write commands you trust, and treat an `importers.toml` you did not author
+like a shell script. A community profile registry must never carry
+`preprocess` entries.
+
 ## See Also
 
 - [Importing Guide](../guides/importing.md) - Detailed import tutorial
