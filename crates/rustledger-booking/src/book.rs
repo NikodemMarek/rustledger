@@ -619,17 +619,28 @@ impl BookingEngine {
         })
     }
 
-    /// Apply ONE posting to the running inventories, returning an error if it
-    /// reduces a lot that is not held.
+    /// Apply ONE booked posting to the running inventories.
     ///
-    /// The per-posting core of [`Self::apply`], which ignores a reduction failure
-    /// per its booked-input contract; the fallible signature keeps the over-sell
-    /// detectable by the `debug_assert` there.
+    /// The canonical "what does this posting do to an inventory" decision:
+    /// resolve the account's booking method, then REDUCE against a lot or ADD a
+    /// new one. Public because the query engine needs exactly this and was
+    /// re-deriving a broken half of it — `Inventory::add` unconditionally, with
+    /// no reduction branch at all (#1985). That looked right for FIFO/LIFO,
+    /// where booking has already resolved the reduction's cost so its lot key
+    /// matches an existing lot and `add` nets it by coincidence, and produced a
+    /// dangling negative position under AVERAGE, where the reduction is booked
+    /// at the merged average cost — a key belonging to no augmentation.
     ///
     /// # Errors
-    /// Returns the reduce error when the posting reduces a lot that is not held
-    /// (an over-sell / unbooked-input contract violation).
-    fn try_apply_posting(
+    ///
+    /// [`BookingError`] when the reduction finds no matching lot, or an `add`
+    /// overflows. Unlike [`Self::apply`] this is a SINGLE posting, so there is
+    /// nothing to roll back — the caller owns transaction atomicity.
+    ///
+    /// # Precondition
+    ///
+    /// Same as [`Self::apply`]: the posting must already be booked.
+    pub fn apply_posting(
         &mut self,
         posting: &Posting,
         date: rustledger_core::NaiveDate,
@@ -843,7 +854,7 @@ impl BookingEngine {
             // other. Callers already handle this — `book()` records the error
             // and marks the transaction failed, the wasm entry point checks
             // `is_ok()`, and the CLI refuses to derive a figure at all.
-            if let Err(e) = self.try_apply_posting(posting, txn.date) {
+            if let Err(e) = self.apply_posting(posting, txn.date) {
                 // `snapshot` is `Some` whenever this arm is reachable:
                 // `rollback_needed` covers both failure modes. Restoring
                 // nothing would be silent corruption — precisely the bug being
