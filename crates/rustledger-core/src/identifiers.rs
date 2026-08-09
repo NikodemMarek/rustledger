@@ -333,6 +333,41 @@ pub fn is_subaccount_or_equal(child: &str, parent: &str) -> bool {
 /// classify accounts in a config-aware context.
 pub const ACCOUNT_TYPES: [&str; 5] = ["Assets", "Liabilities", "Equity", "Income", "Expenses"];
 
+/// Whether a bare word is one of the DEFAULT account-type roots.
+///
+/// Named for what it does, not for what it might be mistaken for. It was
+/// `is_account_type`, which promises CLASSIFICATION — and on a ledger with
+/// `option "name_expenses" "Depenses"` it answers `false` for `Depenses` and
+/// `true` for `Expenses`, both wrong as classification. It is inert today
+/// because a bare root is not a valid account name, so nothing downstream can
+/// act on it (#1964); the name was the part that could mislead the next
+/// caller, who might use it where it is not inert.
+///
+/// The single implementation of a question the editor surfaces both asked
+/// separately: `rustledger-lsp` matched against [`ACCOUNT_TYPES`] while
+/// `rustledger-wasm` inlined its own `matches!` over the same five strings.
+/// They agreed only because the two lists happened to hold the same words, and
+/// each carried its own copy of the same five-case test — so a drift would have
+/// left both suites passing while the two surfaces disagreed. That is the
+/// re-derivation shape the duplication review (#1731–#1743) traced every found
+/// bug to, and #1964 is the same shape one layer up.
+///
+/// # Not config-aware, deliberately
+///
+/// This answers for the default English roots only. It exists for the editor's
+/// lexical question — "does this bare word look like an account root, so should
+/// I offer hover/definition affordances?" — asked about a word that is often
+/// typed into a buffer with no ledger loaded at all.
+///
+/// It is NOT the classifier for an account you hold. A bare root is not even a
+/// valid account name (`open Assets` is a parse error), so every real account
+/// reference contains a `:` and should be classified with [`AccountTypes`],
+/// which honors the `name_*` renames.
+#[must_use]
+pub fn is_default_account_root(word: &str) -> bool {
+    ACCOUNT_TYPES.contains(&word)
+}
+
 /// The five beancount account-type kinds, independent of their configured
 /// root names.
 ///

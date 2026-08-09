@@ -473,12 +473,6 @@ pub fn is_account_like(s: &str) -> bool {
             .any(|t| s.starts_with(t))
 }
 
-/// Check if a string is a standard root account type.
-#[must_use]
-pub fn is_account_type(s: &str) -> bool {
-    rustledger_core::ACCOUNT_TYPES.contains(&s)
-}
-
 /// Check if a string looks like a currency (simple format check).
 ///
 /// Currencies are typically 2-5 uppercase letters/digits (e.g., USD, EUR, BTC).
@@ -904,13 +898,47 @@ mod tests {
         assert!(!is_account_like("Random:Thing"));
     }
 
+    /// The two account-root lists must not drift apart.
+    ///
+    /// `rustledger-completion` keeps its own copy because it has no
+    /// dependencies at all — that is what lets both the LSP and the WASM editor
+    /// take it. A deliberate copy is only allowed here if something asserts the
+    /// agreement (CLAUDE.md's canonical-function rule), and nothing did: each
+    /// crate tested its own list against its own expectations, so a change to
+    /// one would have left both suites green while the two surfaces disagreed
+    /// about what an account root is.
+    ///
+    /// This lives in the LSP because it is a crate that can see BOTH, which
+    /// neither of the two owners can.
     #[test]
-    fn test_is_account_type() {
-        assert!(is_account_type("Assets"));
-        assert!(is_account_type("Liabilities"));
-        assert!(is_account_type("Income"));
-        assert!(!is_account_type("Bank"));
-        assert!(!is_account_type("assets"));
+    fn account_types_match_core() {
+        assert_eq!(
+            rustledger_completion::ACCOUNT_TYPES,
+            rustledger_core::ACCOUNT_TYPES,
+            "rustledger-completion's ACCOUNT_TYPES has drifted from \
+             rustledger-core's; they are a deliberate copy of one another and \
+             every editor surface assumes they agree"
+        );
+    }
+
+    /// And the predicate must answer for exactly that list.
+    ///
+    /// Guards the direction the equality above cannot: a future
+    /// `is_default_account_root` that hardcoded its own words would still pass a test
+    /// comparing two constants. This asks the function about every root, and
+    /// about a word that is not one.
+    #[test]
+    fn is_default_account_root_answers_for_every_root() {
+        for root in rustledger_core::ACCOUNT_TYPES {
+            assert!(
+                rustledger_core::is_default_account_root(root),
+                "{root} is an account root but is_default_account_root says otherwise"
+            );
+        }
+        assert!(
+            !rustledger_core::is_default_account_root("Depenses"),
+            "a renamed root is not a default"
+        );
     }
 
     #[test]
