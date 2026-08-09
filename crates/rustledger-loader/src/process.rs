@@ -1343,7 +1343,12 @@ pub fn validation_options_from_options(
 /// Absolute entries pass through; relative entries join onto `base_dir` when it
 /// is `Some`, otherwise are kept as-is (single-file buffers without an on-disk
 /// path). Shared so `check` and the LSP resolve document directories identically.
-#[cfg(feature = "validation")]
+///
+/// NOT gated on the `validation` feature. It used to be, which is half of why
+/// the E7006 existence check in `options.rs` grew its own `Path::new(value)`
+/// instead of calling this — and that resolved against the process CWD (#1999).
+/// A path helper with no validation dependency has no reason to be unavailable
+/// to the loader.
 #[must_use]
 pub fn resolve_document_dirs(
     documents: &[String],
@@ -1360,6 +1365,48 @@ pub fn resolve_document_dirs(
             } else {
                 path.to_path_buf()
             }
+        })
+        .collect()
+}
+
+/// E7006 warnings for `option "documents"` roots that do not exist on disk.
+///
+/// The single source of truth for the check. `Loader::load` calls it with the
+/// ledger's directory; the LSP's single-file fallback calls it with the open
+/// buffer's directory. It deliberately does NOT live in `Options::set`, which
+/// has no base dir and so could only ever ask about the process CWD — that was
+/// #1999, where `rledger check sub/ledger.bean` reported a document root that
+/// was sitting right next to the ledger.
+///
+/// A `None` `base_dir` (an unsaved buffer with no path) checks only absolute
+/// roots. Relative ones are skipped rather than guessed at, because the only
+/// thing left to resolve them against is the CWD, and that is the bug.
+///
+/// Probing goes through `fs` rather than [`std::path::Path::exists`] so the
+/// check honors the loader's injected filesystem instead of reaching past it
+/// to the host. That matters for in-memory loads: a [`VirtualFileSystem`] has
+/// no directory entries, and a raw host probe would warn on every one.
+///
+/// [`VirtualFileSystem`]: crate::VirtualFileSystem
+#[must_use]
+pub fn document_root_warnings(
+    documents: &[String],
+    base_dir: Option<&std::path::Path>,
+    fs: &dyn crate::vfs::FileSystem,
+) -> Vec<crate::options::OptionWarning> {
+    documents
+        .iter()
+        .zip(resolve_document_dirs(documents, base_dir))
+        .filter(|(value, _)| base_dir.is_some() || std::path::Path::new(value).is_absolute())
+        .filter(|(_, resolved)| !fs.dir_exists(resolved))
+        .map(|(value, resolved)| crate::options::OptionWarning {
+            code: "E7006",
+            message: format!(
+                "Document root '{value}' does not exist (resolved to '{}')",
+                resolved.display()
+            ),
+            option: "documents".to_string(),
+            value: value.clone(),
         })
         .collect()
 }
