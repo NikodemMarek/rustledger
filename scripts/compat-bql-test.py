@@ -103,6 +103,48 @@ KNOWN_PYTHON_DIVERGENCES: set[tuple[str, str]] = {
     ("tests/compatibility/files/beancount-import/testdata_source_generic_importer_test_invalid_journal.beancount", "*"),
     # DisplayContext common vs max precision (#724)
     ("tests/compatibility/files/beancount-import/testdata_source_ofx_test_fidelity_journal.beancount", "*"),
+    # The valuation plugin strands a 1e-7 phantom position on a fully-withdrawn
+    # fund, and beancount's copy of it keeps that phantom where ours no longer
+    # does (#2018).
+    #
+    # Both implementations used to leave it. rledger's now closes the fund to
+    # exactly zero, so these pairs report `0.0000001 COOL_FUND_USD` /
+    # `SOME_FUND_USD` on the Python side and an empty inventory on ours. The
+    # ledgers say "withdraw all" and the cash legs are exact, so zero is the
+    # right answer and the mismatch is Python's.
+    #
+    # Verified against beancount 3.2.3 + beancount_lazy_plugins by dumping both
+    # plugins' synthesized postings: they agree on 6 of the 7, and diverge only
+    # on the final lot, which beancount under-sells by 1e-7. Per-posting table
+    # in #2018.
+    #
+    # Surgical rather than a `"*"` wildcard: only queries that project a
+    # position or a balance can see this, and pinning the whole file would mask
+    # an unrelated regression on the other queries.
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_cool_fund_example.beancount",
+        "balances-by-account",
+    ),
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_cool_fund_example.beancount",
+        "journal-assets-at-units",
+    ),
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_cool_fund_example.beancount",
+        "last-balance-by-month",
+    ),
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_cool_fund_example.beancount",
+        "position-by-date",
+    ),
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_cool_fund_example.beancount",
+        "sum-position-by-account",
+    ),
+    (
+        "tests/compatibility/files/beancount-lazy-plugins/tests_data_some_fund_example.beancount",
+        "balances-by-account",
+    ),
     # beancount/beanquery#279 used to be pinned here, 56 fixtures of it. It is
     # not masked any more because it is no longer a divergence: the corpus query
     # now selects `LAST(balance)` alongside `FIRST(balance)`, which forces
@@ -1220,12 +1262,25 @@ def main() -> int:
         # partial ledger and both sides came back empty is a FALSE match, and
         # honestly reclassifying it as inconclusive would be reported as a
         # regression it never was.
+        # A pair registered as a DELIBERATE divergence is likewise not a
+        # regression. Registering one is the act of saying "these two are
+        # expected to differ, and here is which side is wrong"; if the gate
+        # ignored that, the registries could never absorb a newly-created
+        # divergence and the only way to land a fix that makes us diverge
+        # ON PURPOSE would be to bypass the gate entirely.
+        #
+        # This does not blunt the gate, because the exemption is paired: an
+        # entry whose pair starts MATCHING again fails the run via
+        # `stale_divergence_entries` above, so a registration cannot outlive
+        # the divergence it documents and quietly cover a later regression on
+        # the same pair.
         regressed = [
             r
             for r in results
             if not r.match
             and not (r.py_failed or r.rs_failed)
             and (r.file, r.query_name) in baseline_passing
+            and not _is_known_divergence(r)
         ]
         if regressed:
             print()
