@@ -301,8 +301,12 @@ fn update_column_context(col_ctx: &mut DisplayContext, value: &Value, ledger_ctx
                 col_ctx.update(quantized, cost.currency.as_str());
             }
         }
+        // Observe the NETTED positions, i.e. exactly what `format_value`
+        // will print — see `rendered_inventory_positions`. Walking the raw
+        // lots here made the histogram describe numbers that never appear
+        // in the output.
         Value::Inventory(inv) => {
-            for pos in inv.positions() {
+            for pos in rendered_inventory_positions(inv) {
                 let quantized = ledger_ctx.quantize(pos.units.number, pos.units.currency.as_str());
                 col_ctx.update(quantized, pos.units.currency.as_str());
                 if let Some(ref cost) = pos.cost {
@@ -493,6 +497,92 @@ pub(super) fn format_value_with_hint(
     format_value(value, numberify, ctx)
 }
 
+/// Collapse an inventory's raw lots into the positions that are actually
+/// RENDERED: one per `(units currency, cost key)`, summed, in display order.
+///
+/// Shared deliberately by the formatter and by the display-precision
+/// histogram in [`update_column_context`]. They used to derive this
+/// separately — the formatter aggregated, the histogram walked
+/// `inv.positions()` raw — so the column's inferred precision described a
+/// different set of numbers than the ones printed.
+///
+/// That is not academic. A running `balance` column re-observes every
+/// surviving lot on every row, so an early integer-valued lot is counted once
+/// per row it persists in and can outvote the fractional lots that net against
+/// it. On the `beancount-lazy-plugins` `COOL_FUND` ledger the raw walk yielded
+/// 5 samples at 0dp against 4 at 7dp — mode 0 — and
+/// `545.4545455 COOL_FUND_USD` printed as `545`, while bean-query (which
+/// histograms the netted value it prints) chose 7dp. Aggregating first gives
+/// 2 samples at 0dp against 4 at 7dp, and the two agree.
+fn rendered_inventory_positions(
+    inv: &rustledger_core::Inventory,
+) -> Vec<rustledger_core::Position> {
+    use rustledger_core::{Cost, Currency, Position};
+    use std::collections::HashMap;
+
+    // Key on the typed values rather than a formatted string. `Currency` and
+    // `Cost` are both `Eq + Hash`, and `rust_decimal`'s `Hash` agrees with its
+    // `Eq` — `1.00` and `1` compare equal AND hash equal — so lots written at
+    // `{1.00 USD}` and `{1 USD}` still net together, which is what the old
+    // key's `number.normalize()` was there to ensure. Avoids two allocations
+    // per lot on a path walked once per row.
+    let mut aggregated: HashMap<(Currency, Option<Cost>), Position> = HashMap::new();
+    for pos in inv.positions().filter(|p| !p.is_empty()) {
+        let key = (pos.units.currency.clone(), pos.cost.clone());
+
+        aggregated
+            .entry(key)
+            .and_modify(|existing| {
+                existing.units.number += pos.units.number;
+            })
+            .or_insert_with(|| pos.clone());
+    }
+
+    // Drop positions that net to exactly zero. The formatter already skips
+    // them (`position_renders_as_zero`), so leaving them in would reintroduce
+    // in miniature the very mismatch this function exists to remove: a sample
+    // in the histogram with no corresponding number in the output.
+    let mut sorted_positions: Vec<Position> = aggregated
+        .into_values()
+        .filter(|p| !position_renders_as_zero(p))
+        .collect();
+    sorted_positions.sort_by(|a, b| {
+        if a.units.currency != b.units.currency {
+            return a.units.currency.cmp(&b.units.currency);
+        }
+        let qty_cmp = b.units.number.cmp(&a.units.number);
+        if qty_cmp != std::cmp::Ordering::Equal {
+            return qty_cmp;
+        }
+        match (&a.cost, &b.cost) {
+            (Some(ca), Some(cb)) => {
+                if ca.currency != cb.currency {
+                    return ca.currency.cmp(&cb.currency);
+                }
+                if ca.number != cb.number {
+                    return cb.number.cmp(&ca.number);
+                }
+                if ca.date != cb.date {
+                    return ca.date.cmp(&cb.date);
+                }
+                // Label is the last discriminator. It is part of `Cost`'s
+                // `Eq`/`Hash`, so two lots differing only by label survive
+                // aggregation as separate entries — and without this arm they
+                // compared Equal and their order fell out of `HashMap`
+                // iteration, which is seeded per process. The same query on
+                // the same file could print its rows in either order run to
+                // run. With it the comparator is total: anything that still
+                // ties shares a key and was already netted.
+                ca.label.cmp(&cb.label)
+            }
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    sorted_positions
+}
+
 pub(super) fn format_value(value: &Value, numberify: bool, ctx: &DisplayContext) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -532,58 +622,12 @@ pub(super) fn format_value(value: &Value, numberify: bool, ctx: &DisplayContext)
             }
         }
         Value::Inventory(inv) => {
-            use rustledger_core::Position;
-            use std::collections::HashMap;
+            let sorted_positions = rendered_inventory_positions(inv);
 
-            let mut aggregated: HashMap<(String, Option<String>), Position> = HashMap::new();
-            for pos in inv.positions().filter(|p| !p.is_empty()) {
-                let cost_key = pos.cost.as_ref().map(|c| {
-                    format!(
-                        "{}|{}|{:?}|{:?}",
-                        c.number.normalize(),
-                        c.currency,
-                        c.date,
-                        c.label
-                    )
-                });
-                let key = (pos.units.currency.to_string(), cost_key);
-
-                aggregated
-                    .entry(key)
-                    .and_modify(|existing| {
-                        existing.units.number += pos.units.number;
-                    })
-                    .or_insert_with(|| pos.clone());
-            }
-
-            let mut sorted_positions: Vec<_> = aggregated.values().collect();
-            sorted_positions.sort_by(|a, b| {
-                if a.units.currency != b.units.currency {
-                    return a.units.currency.cmp(&b.units.currency);
-                }
-                let qty_cmp = b.units.number.cmp(&a.units.number);
-                if qty_cmp != std::cmp::Ordering::Equal {
-                    return qty_cmp;
-                }
-                match (&a.cost, &b.cost) {
-                    (Some(ca), Some(cb)) => {
-                        if ca.currency != cb.currency {
-                            return ca.currency.cmp(&cb.currency);
-                        }
-                        if ca.number != cb.number {
-                            return cb.number.cmp(&ca.number);
-                        }
-                        ca.date.cmp(&cb.date)
-                    }
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            });
-
+            // No zero-filter here: `rendered_inventory_positions` already
+            // applied it, so this list IS the printed set.
             let positions: Vec<String> = sorted_positions
                 .iter()
-                .filter(|p| !position_renders_as_zero(p))
                 .map(|p| {
                     if numberify {
                         ctx.format_amount_number(p.units.number, p.units.currency.as_str())
@@ -711,6 +755,222 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use rustledger_core::{Amount, Cost, Inventory, Position};
+
+    /// The precision histogram must describe the numbers that are PRINTED.
+    ///
+    /// A running `balance` column carries the same lots forward row after row,
+    /// so observing raw lots counts a long-lived one once per row it survives
+    /// in. On the `COOL_FUND` ledger that gave 5 samples at 0dp against 4 at
+    /// 7dp — mode 0 — and `545.4545455 COOL_FUND_USD` printed as `545`, while
+    /// bean-query printed `545.4545455`. Netting first is what makes the two
+    /// agree, so this asserts the histogram and the formatter see one list.
+    #[test]
+    fn test_column_context_observes_netted_positions_not_raw_lots() {
+        let cost = Cost {
+            number: dec!(1.00),
+            currency: "USD".into(),
+            date: Some(rustledger_core::NaiveDate::constant(2024, 1, 10)),
+            label: None,
+        };
+        let lot = |n| Position {
+            units: Amount::new(n, "COOL_FUND_USD"),
+            cost: Some(cost.clone()),
+        };
+        let inv_of = |lots: &[rust_decimal::Decimal]| {
+            let mut inv = Inventory::new();
+            for n in lots {
+                inv.add(lot(*n)).expect("add");
+            }
+            inv
+        };
+
+        // The cumulative balance as it appears on each row of the COOL_FUND
+        // ledger. A single row would NOT expose the bug: its raw lots are one
+        // 0dp and one 7dp sample, and `mode()` breaks that tie toward 7
+        // anyway. It takes the running column, where the integer lot is
+        // re-observed on every row it survives, for 0dp to win the vote.
+        let rows = [
+            vec![dec!(1000)],
+            vec![dec!(1000)],
+            vec![dec!(1000), dec!(-454.5454545)],
+            vec![dec!(1000), dec!(-454.5454545)],
+            vec![dec!(1000), dec!(-454.5454545), dec!(-545.4545455)],
+            vec![dec!(1000), dec!(-454.5454545)],
+        ];
+
+        let ledger_ctx = DisplayContext::new();
+        let mut col_ctx = DisplayContext::new();
+        for lots in &rows {
+            let value = Value::Inventory(Box::new(inv_of(lots)));
+            update_column_context(&mut col_ctx, &value, &ledger_ctx);
+        }
+
+        // Netted, the column sees mostly 7dp values. Walking raw lots instead
+        // counts `1000` once per row and drives the mode to 0, which printed
+        // `545.4545455 COOL_FUND_USD` as `545` where bean-query printed it in
+        // full.
+        assert_eq!(
+            col_ctx.get_precision("COOL_FUND_USD"),
+            Some(7),
+            "precision must be inferred from the netted values that are printed"
+        );
+
+        // The netting itself, and the end-to-end cell.
+        let inv = inv_of(&rows[2]);
+        let rendered = rendered_inventory_positions(&inv);
+        assert_eq!(rendered.len(), 1, "lots at one cost net together");
+        assert_eq!(rendered[0].units.number, dec!(545.4545455));
+        let out = format_value(&Value::Inventory(Box::new(inv)), false, &col_ctx);
+        assert!(out.starts_with("545.4545455 COOL_FUND_USD"), "got: {out}");
+    }
+
+    /// Ordering is deterministic for lots that differ only by cost label.
+    ///
+    /// `Cost`'s `Eq`/`Hash` include `label`, so `{1 USD, "lot-a"}` and
+    /// `{1 USD, "lot-b"}` stay separate entries. Before the label tie-break
+    /// they compared Equal and their relative order came from `HashMap`
+    /// iteration — seeded per process, so a run could print either order.
+    /// Rebuilding the inventory many times here is the point: a single
+    /// construction cannot observe the instability.
+    #[test]
+    fn test_label_only_lots_have_deterministic_order() {
+        let lot = |label: &str| Position {
+            units: Amount::new(dec!(2), "AAA"),
+            cost: Some(Cost {
+                number: dec!(1),
+                currency: "USD".into(),
+                date: Some(rustledger_core::NaiveDate::constant(2024, 1, 1)),
+                label: Some(label.to_string()),
+            }),
+        };
+
+        let mut orderings = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let mut inv = Inventory::new();
+            inv.add(lot("lot-b")).expect("add");
+            inv.add(lot("lot-a")).expect("add");
+            let labels: Vec<String> = rendered_inventory_positions(&inv)
+                .into_iter()
+                .filter_map(|p| p.cost?.label)
+                .collect();
+            orderings.insert(labels.join(","));
+        }
+        assert_eq!(
+            orderings,
+            std::collections::HashSet::from(["lot-a,lot-b".to_string()]),
+            "order must be stable and label-ascending"
+        );
+    }
+
+    /// Lots whose costs are numerically equal but written at different
+    /// scales — `{1.00 USD}` and `{1 USD}` — must still net into one
+    /// position.
+    ///
+    /// This is load-bearing for the typed `(Currency, Option<Cost>)`
+    /// aggregation key. The key it replaced stringified `number.normalize()`
+    /// precisely to collapse those two; the typed key relies instead on
+    /// `rust_decimal`'s `Hash` agreeing with its `Eq`. If that ever stopped
+    /// holding, the lots would silently stop netting and the column would
+    /// print two rows where beancount prints one.
+    #[test]
+    fn test_costs_equal_at_different_scales_net_together() {
+        let cost = |n| {
+            Some(Cost {
+                number: n,
+                currency: "USD".into(),
+                date: Some(rustledger_core::NaiveDate::constant(2024, 1, 1)),
+                label: None,
+            })
+        };
+        let mut inv = Inventory::new();
+        inv.add(Position {
+            units: Amount::new(dec!(2), "AAA"),
+            cost: cost(dec!(1.00)),
+        })
+        .expect("add");
+        inv.add(Position {
+            units: Amount::new(dec!(3), "AAA"),
+            cost: cost(dec!(1)),
+        })
+        .expect("add");
+
+        let rendered = rendered_inventory_positions(&inv);
+        assert_eq!(
+            rendered.len(),
+            1,
+            "`{{1.00 USD}}` and `{{1 USD}}` are the same lot: {rendered:?}"
+        );
+        assert_eq!(rendered[0].units.number, dec!(5));
+    }
+
+    /// Display order of the netted positions: currency, then quantity
+    /// descending, then cost-less ahead of held-at-cost, then cost currency
+    /// ascending, cost number descending, and acquisition date ascending.
+    ///
+    /// Covers the comparator arms the netting test above never reaches — it
+    /// uses a single currency at a single cost, so every tie-break below was
+    /// dead to it. Each lot here is given a DISTINCT cost key on purpose;
+    /// sharing one would net the lots together (as the first draft of this
+    /// test discovered) and the tie-break would never be compared.
+    #[test]
+    fn test_rendered_inventory_positions_display_order() {
+        let day = |d| Some(rustledger_core::NaiveDate::constant(2024, 1, d));
+        let at = |n, ccy: &str, d| {
+            Some(Cost {
+                number: n,
+                currency: ccy.into(),
+                date: day(d),
+                label: None,
+            })
+        };
+        let pos = |n, ccy: &str, cost| Position {
+            units: Amount::new(n, ccy),
+            cost,
+        };
+
+        let mut inv = Inventory::new();
+        // Deliberately inserted out of display order.
+        inv.add(pos(dec!(5), "ZZZ", None)).expect("add");
+        inv.add(pos(dec!(1), "AAA", at(dec!(2), "USD", 2)))
+            .expect("add");
+        inv.add(pos(dec!(1), "AAA", at(dec!(2), "USD", 1)))
+            .expect("add");
+        inv.add(pos(dec!(1), "AAA", at(dec!(3), "USD", 1)))
+            .expect("add");
+        inv.add(pos(dec!(1), "AAA", at(dec!(2), "EUR", 1)))
+            .expect("add");
+        inv.add(pos(dec!(1), "AAA", None)).expect("add");
+        inv.add(pos(dec!(7), "AAA", None)).expect("add");
+
+        let got: Vec<_> = rendered_inventory_positions(&inv)
+            .into_iter()
+            .map(|p| {
+                (
+                    p.units.currency.to_string(),
+                    p.units.number,
+                    p.cost.map(|c| (c.number, c.currency.to_string(), c.date)),
+                )
+            })
+            .collect();
+
+        let aaa = |n, cost| ("AAA".to_string(), n, cost);
+        assert_eq!(
+            got,
+            vec![
+                // Quantity descending within a currency. The two cost-less
+                // AAA lots share a key, so they net to 8.
+                aaa(dec!(8), None),
+                // Equal quantities: cost currency ascending...
+                aaa(dec!(1), Some((dec!(2), "EUR".to_string(), day(1)))),
+                // ...then cost number DESCENDING...
+                aaa(dec!(1), Some((dec!(3), "USD".to_string(), day(1)))),
+                // ...then acquisition date ascending.
+                aaa(dec!(1), Some((dec!(2), "USD".to_string(), day(1)))),
+                aaa(dec!(1), Some((dec!(2), "USD".to_string(), day(2)))),
+                ("ZZZ".to_string(), dec!(5), None),
+            ]
+        );
+    }
 
     /// Cost-spec braces in BQL output match Beancount's
     /// `Position.__str__`: `{ 128.99 USD}` — single space after `{`,
