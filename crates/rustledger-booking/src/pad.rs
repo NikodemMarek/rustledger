@@ -360,6 +360,17 @@ fn create_padding_transaction(
 /// re-applies them against an inventory that already includes the prior
 /// synth. A `debug_assert!` guards against this in dev builds.
 pub fn merge_with_padding(directives: &[Directive]) -> Vec<Directive> {
+    merge_with_padding_owned(directives.to_vec())
+}
+
+/// [`merge_with_padding`] for a caller that already owns its directives.
+///
+/// Exists so consumers holding an owned `Vec` need not clone it a second time
+/// just to reach the canonical placement rule. `Ledger::balance_view` used to
+/// inline the merge for exactly that reason, and the copy drifted the moment
+/// the rule changed — this is the same saving without the duplicate.
+#[must_use]
+pub fn merge_with_padding_owned(directives: Vec<Directive>) -> Vec<Directive> {
     // Idempotence: input that already contains synth pad transactions has
     // been merged before (e.g. an embedder queries entries it loaded via
     // load-full, which merges pads — rustledger#1712). Re-running would
@@ -368,26 +379,70 @@ pub fn merge_with_padding(directives: &[Directive]) -> Vec<Directive> {
         .iter()
         .any(|d| matches!(d, Directive::Transaction(t) if is_synthesized_pad(t)))
     {
-        return directives.to_vec();
+        return directives;
     }
 
-    let result = process_pads(directives);
+    let result = process_pads(&directives);
 
-    // Prepend synths so stable sort puts them BEFORE same-date originals.
-    // On a same-date pad+balance pair, the order is `[synth, pad, balance]`
-    // post-sort (synths start at the front of their date-group). This is
-    // important for any consumer that runs balance-assertion checks
-    // mid-stream against the merged view.
-    let mut merged: Vec<Directive> =
-        Vec::with_capacity(directives.len() + result.padding_transactions.len());
-    for txn in result.padding_transactions {
-        merged.push(Directive::Transaction(txn));
-    }
-    merged.extend(directives.iter().cloned());
-
+    let mut merged: Vec<Directive> = directives;
     merged.sort_by_key(rustledger_core::Directive::date);
 
+    for txn in result.padding_transactions {
+        let insert_at = pad_insertion_index(merged.iter(), txn.date);
+        merged.insert(insert_at, Directive::Transaction(txn));
+    }
+
     merged
+}
+
+/// Where a synthesized padding transaction dated `date` belongs in an
+/// already date-sorted directive stream.
+///
+/// The rule: immediately BEFORE the first `Balance` sharing its date, and
+/// otherwise at the END of its date group.
+///
+/// The "before a same-date Balance" half is load-bearing: a `pad` and the
+/// `balance` it satisfies can share a date, and any consumer checking
+/// assertions mid-stream must see the padding first.
+///
+/// The "otherwise at the end" half is what stops the synth displacing
+/// UNRELATED same-date directives. Prepending it to the whole date group did
+/// that: on `ledger2beancount/tests_balance-assertion.beancount` a 2019-01-29
+/// pad for `Assets:Test6` jumped ahead of an unrelated 2019-01-29 transaction
+/// for `Assets:Test5`, and every running balance from that row on was
+/// 500.00 USD out relative to bean-query, which orders the padding at the
+/// `pad` directive's own position.
+///
+/// This is the single source of truth for pad placement. It is `pub` because
+/// the rule has three consumers with three different element types —
+/// [`merge_with_padding_owned`] over `Directive`,
+/// [`merge_with_padding_spanned`] over [`Spanned<Directive>`], and
+/// `rustledger-ffi-wasi`'s `expand_pads` over `(Directive, tag)` pairs, which
+/// carries parallel provenance tags and so cannot call either merge. All three
+/// once open-coded the rule; two of the copies were still prepending when this
+/// one changed. Compute the index here rather than re-deriving it.
+///
+/// Cost: one insert per synth into an already-sorted vector, so O(n x k) for
+/// k pads rather than a single O(n log n) pass. `pad` is used sparingly by
+/// construction — one per account per period — and callers early-return on a
+/// ledger with none; the heaviest file in the compat corpus carries 12. If a
+/// ledger ever arrives with pads in the thousands, merge the (date-sorted)
+/// synths in one pass instead.
+#[must_use]
+pub fn pad_insertion_index<'a, I>(sorted: I, date: NaiveDate) -> usize
+where
+    I: IntoIterator<Item = &'a Directive>,
+{
+    let mut end_of_group = 0;
+    for (index, directive) in sorted.into_iter().enumerate() {
+        if directive.date() == date && matches!(directive, Directive::Balance(_)) {
+            return index;
+        }
+        if directive.date() <= date {
+            end_of_group = index + 1;
+        }
+    }
+    end_of_group
 }
 
 /// Span-preserving variant of [`merge_with_padding`].
@@ -417,16 +472,15 @@ pub fn merge_with_padding_spanned(directives: &[Spanned<Directive>]) -> Vec<Span
 
     let result = process_pads(&plain);
 
-    // Prepend synth transactions (same ordering rationale as the plain variant)
-    // and mark them as synthesized so they resolve to no source location.
-    let mut merged: Vec<Spanned<Directive>> =
-        Vec::with_capacity(directives.len() + result.padding_transactions.len());
-    for txn in result.padding_transactions {
-        merged.push(Spanned::synthesized(Directive::Transaction(txn)));
-    }
-    merged.extend(directives.iter().cloned());
-
+    // Placement via the shared [`pad_insertion_index`]. Marked synthesized so
+    // they resolve to no source location.
+    let mut merged: Vec<Spanned<Directive>> = directives.to_vec();
     merged.sort_by_key(|s| s.value.date());
+
+    for txn in result.padding_transactions {
+        let insert_at = pad_insertion_index(merged.iter().map(|s| &s.value), txn.date);
+        merged.insert(insert_at, Spanned::synthesized(Directive::Transaction(txn)));
+    }
 
     merged
 }
@@ -710,6 +764,60 @@ mod tests {
         assert!(
             !is_synthesized_pad(&user_p),
             "user-written P-flag transaction must not be classified as synth",
+        );
+    }
+
+    #[test]
+    fn test_merge_with_padding_synth_does_not_displace_unrelated_same_date_entry() {
+        // A pad whose balance lands on a LATER date must not jump ahead of an
+        // unrelated transaction sharing the pad's date. Prepending synths to
+        // the whole date group did exactly that, and every running balance
+        // from that row on was off by the padding amount.
+        //
+        // This is the other half of the placement rule from
+        // `test_merge_with_padding_same_date_pad_balance_synth_comes_first`:
+        // with no same-date Balance to sit in front of, the synth belongs at
+        // the END of its date group, which is where bean-query puts it.
+        let directives = vec![
+            Directive::Open(Open::new(date(2024, 1, 1), "Assets:Bank")),
+            Directive::Open(Open::new(date(2024, 1, 1), "Assets:Other")),
+            Directive::Open(Open::new(date(2024, 1, 1), "Equity:Opening")),
+            // Unrelated transaction, same date as the pad below.
+            Directive::Transaction(
+                Transaction::new(date(2024, 1, 2), "unrelated")
+                    .with_synthesized_posting(Posting::new(
+                        "Assets:Other",
+                        Amount::new(dec!(10), "USD"),
+                    ))
+                    .with_synthesized_posting(Posting::new(
+                        "Equity:Opening",
+                        Amount::new(dec!(-10), "USD"),
+                    )),
+            ),
+            Directive::Pad(Pad::new(date(2024, 1, 2), "Assets:Bank", "Equity:Opening")),
+            // Balance is on a LATER date, so there is no same-date Balance.
+            Directive::Balance(Balance::new(
+                date(2024, 1, 3),
+                "Assets:Bank",
+                Amount::new(dec!(1000), "USD"),
+            )),
+        ];
+
+        let merged = merge_with_padding(&directives);
+
+        let synth_idx = merged
+            .iter()
+            .position(|d| matches!(d, Directive::Transaction(t) if is_synthesized_pad(t)))
+            .expect("synth present");
+        let unrelated_idx = merged
+            .iter()
+            .position(
+                |d| matches!(d, Directive::Transaction(t) if t.narration.as_ref() == "unrelated"),
+            )
+            .expect("unrelated txn present");
+        assert!(
+            unrelated_idx < synth_idx,
+            "unrelated same-date txn (idx {unrelated_idx}) must precede the synth (idx {synth_idx})",
         );
     }
 
