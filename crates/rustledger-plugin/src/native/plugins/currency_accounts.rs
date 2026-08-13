@@ -15,15 +15,19 @@ use super::super::{NativePlugin, RegularPlugin};
 ///    group key** — this matches Python's `group_postings_by_weight_currency`.
 /// 2. If there is at least one price annotation in the transaction and
 ///    there are two or more distinct group keys, inserts a neutralizing
-///    posting for each group. The neutralizing posting goes to
-///    `<base>:<group_key>` and carries the negated weight inventory of
-///    that group (denominated in the weight/cost currency, which may
-///    differ from the group key).
-/// 3. Unlike Python's plugin, does NOT strip `price` annotations from
-///    the original postings. Python strips them because its pipeline
-///    runs plugins before booking; rustledger runs booking first, so
-///    stripping prices would cause balance-check failures (E3001) in
-///    the post-plugin validator.
+///    posting for each group WHOSE COST BASIS IS NON-ZERO (a group that
+///    already nets to zero needs none — see step 3). It goes to
+///    `<base>:<group_key>` and carries the negated COST BASIS of that
+///    group — units, or `units x cost` for a posting held at cost. A
+///    price annotation is deliberately NOT applied, matching Python's
+///    `convert.get_cost`, so the posting is denominated in the group's
+///    own currency.
+/// 3. Postings in a neutralized group have their `price` stripped, as
+///    Python does. Once the group's imbalance is stated explicitly by a
+///    currency-account posting, leaving the price on would double-count
+///    the conversion and the transaction would not balance. Groups whose
+///    cost basis nets to zero get no neutralizing posting and keep their
+///    prices.
 /// 4. Emits `open` directives at the earliest transaction date for all
 ///    newly created currency trading accounts.
 pub struct CurrencyAccountsPlugin {
@@ -161,11 +165,14 @@ impl NativePlugin for CurrencyAccountsPlugin {
             // compile-fail here, which is what we want.
             //   - Cost: canonical cost weight in cost.currency (preserved
             //     totals — no division-then-multiplication precision loss).
-            //   - Price: canonical price weight in price.currency (@@ sign
-            //     follows units).
             //   - Else: (units.amount, units.currency)
-            let weight_of = |posting: &PostingData| -> Option<(Decimal, String)> {
-                use rustledger_core::{BookedCost, CostNumber, PriceKind};
+            //
+            // There is deliberately NO price arm — this is a COST BASIS, not
+            // a weight. Consequently the currency returned here is always the
+            // one the group is keyed on, since both derive it from the same
+            // `cost.currency` / `units.currency` expression.
+            let cost_basis_of = |posting: &PostingData| -> Option<(Decimal, String)> {
+                use rustledger_core::{BookedCost, CostNumber};
                 use rustledger_plugin_types::CostNumberData;
                 let units = posting.units.as_ref()?;
                 let units_num = Decimal::from_str(&units.number).unwrap_or_default();
@@ -219,18 +226,13 @@ impl NativePlugin for CurrencyAccountsPlugin {
                         None => units_num,
                     };
                     Some((amount, currency))
-                } else if let Some(price) = &posting.price {
-                    let price_amount = price.amount.as_ref()?;
-                    let price_num = parse(&price_amount.number);
-                    let currency = price_amount.currency.clone();
-                    let kind = if price.is_total {
-                        PriceKind::Total
-                    } else {
-                        PriceKind::Unit
-                    };
-                    let amount = rustledger_booking::price_weight(units_num, price_num, kind)?;
-                    Some((amount, currency))
                 } else {
+                    // NO price branch. This mirrors Python's
+                    // `convert.get_cost`, which returns the cost basis when
+                    // there is a cost and the bare UNITS otherwise — it never
+                    // applies a price annotation. Using the price-converted
+                    // weight here is what made every neutralizing posting land
+                    // in the price currency.
                     Some((units_num, units.currency.clone()))
                 }
             };
@@ -240,7 +242,7 @@ impl NativePlugin for CurrencyAccountsPlugin {
             for (group_key, posting_indices) in &curmap {
                 let inv = group_inv.entry(group_key).or_default();
                 for &idx in posting_indices {
-                    if let Some((amount, currency)) = weight_of(&txn.postings[idx]) {
+                    if let Some((amount, currency)) = cost_basis_of(&txn.postings[idx]) {
                         *inv.entry(currency).or_default() += amount;
                     }
                 }
@@ -251,30 +253,44 @@ impl NativePlugin for CurrencyAccountsPlugin {
             // (including any with units == None, which are auto-balanced
             // postings that must not be dropped).
             //
-            // Python's plugin strips price annotations here
-            // (currency_accounts.py:145) because its pipeline runs
-            // plugins BEFORE booking. rustledger also runs plugins
-            // before booking (since PR #1116), but we still keep prices
-            // because the appended neutralizing postings already make
-            // each currency group balanced on its own — booking then
-            // fills any elided posting from the per-currency residual
-            // and the extra prices are redundant rather than harmful.
-            // See `rustledger_validate::Phase` docs and CLAUDE.md's
-            // "Python Compatibility Policy" section for the broader
-            // ordering rationale.
+            //
+            // Postings in a neutralized group have their PRICE STRIPPED, as
+            // Python does. This is not cosmetic: once the group's imbalance is
+            // represented explicitly by a currency-account posting, leaving the
+            // price on would double-count the conversion and the transaction
+            // would not balance. Groups that net to zero get no neutralizing
+            // posting and keep their prices, again matching Python.
+            let neutralized: std::collections::HashSet<usize> = curmap
+                .iter()
+                .filter(|(k, _)| group_inv.get(k).is_some_and(|inv| inv.len() == 1))
+                .flat_map(|(_, idxs)| idxs.iter().copied())
+                .collect();
             let mut new_postings: Vec<PostingData> =
                 Vec::with_capacity(txn.postings.len() + curmap.len());
-            for posting in &txn.postings {
-                new_postings.push(posting.clone());
+            for (idx, posting) in txn.postings.iter().enumerate() {
+                let mut posting = posting.clone();
+                if neutralized.contains(&idx) {
+                    posting.price = None;
+                }
+                new_postings.push(posting);
             }
 
             // Append neutralizing postings (sorted by group key for
             // deterministic output).
             for (group_key, inv) in &group_inv {
-                // Python calls `inv.get_only_position()` and errors on
-                // multi-currency groups. We skip neutralization in that
-                // case rather than failing — it indicates a transaction
-                // shape the prototype plugin never handled.
+                // A group's cost basis is denominated in exactly the
+                // currency the group is keyed on, so this map holds at most
+                // one entry (len 0 means the basis netted to zero, which
+                // needs no neutralizing posting — Python's `inv.is_empty()`
+                // branch).
+                //
+                // The `!= 1` guard is therefore unreachable on the >1 side
+                // today; it is kept as a fail-closed backstop. It was
+                // reachable before the cost-basis fix, when a price posting
+                // contributed `price.currency` to a group keyed on
+                // `units.currency` — which is precisely how the wrong-currency
+                // neutralizers arose. Python asserts here via
+                // `get_only_position()`; we skip the group instead.
                 if inv.len() != 1 {
                     continue;
                 }
@@ -452,24 +468,30 @@ mod currency_accounts_tests {
         };
         // 2 originals + 2 neutralizers
         assert_eq!(txn.postings.len(), 4);
-        // Original postings keep their price annotations (rustledger
-        // runs booking before plugins, so stripping prices would cause
-        // E3001 in the validator).
-        assert!(txn.postings[0].price.is_some()); // EUR posting has price
-        assert!(txn.postings[1].price.is_none()); // USD posting never had price
+        // The price is STRIPPED from the EUR posting. Once the group's
+        // imbalance is stated explicitly by a currency-account posting, the
+        // price would double-count the conversion and the transaction would
+        // not balance.
+        assert!(txn.postings[0].price.is_none()); // EUR posting: price stripped
+        assert!(txn.postings[1].price.is_none()); // USD posting never had one
 
-        // EUR group weight is -110 USD → neutralizer +110 USD on Equity:Currency:EUR.
-        // Note the counter-intuitive currency mismatch — this is what Python emits.
+        // The EUR group's COST BASIS is -100 EUR (a price annotation is not a
+        // cost), so the neutralizer is +100 EUR.
+        //
+        // This test previously asserted +110.00 USD here, with a comment
+        // calling the currency mismatch "counter-intuitive... what Python
+        // emits". Python emits no such thing — beancount 3.2.3 on this exact
+        // ledger produces `Equity:Currency:EUR 100 EUR`. The old expectation
+        // also made the method useless: two neutralizers in the SAME currency
+        // are equal and opposite, so `Equity:Currency:*` always summed to
+        // zero and could never show the FX gain the accounts exist to track.
         let eur_neut = txn
             .postings
             .iter()
             .find(|p| p.account == "Equity:Currency:EUR")
             .expect("missing EUR neutralizer");
-        // rust_decimal preserves precision of operands: -100 * 1.10 = -110.00,
-        // so the negated weight string is "110.00" (two trailing zeros from
-        // the 1.10 factor). Python prints the same Decimal as "110.00".
-        assert_eq!(eur_neut.units.as_ref().unwrap().number, "110.00");
-        assert_eq!(eur_neut.units.as_ref().unwrap().currency, "USD");
+        assert_eq!(eur_neut.units.as_ref().unwrap().number, "100");
+        assert_eq!(eur_neut.units.as_ref().unwrap().currency, "EUR");
 
         // USD group weight is +110 USD → neutralizer -110 USD on Equity:Currency:USD.
         let usd_neut = txn
@@ -479,6 +501,73 @@ mod currency_accounts_tests {
             .expect("missing USD neutralizer");
         assert_eq!(usd_neut.units.as_ref().unwrap().number, "-110");
         assert_eq!(usd_neut.units.as_ref().unwrap().currency, "USD");
+    }
+
+    /// A group whose COST BASIS nets to zero gets no neutralizing posting,
+    /// and — importantly — keeps its price annotations.
+    ///
+    /// Mirrors Python's `if inv.is_empty(): new_postings.extend(postings)`
+    /// branch, which re-inserts that group's postings untouched. Verified
+    /// against beancount 3.2.3: its `Inventory` drops zero positions, so a
+    /// group summing to zero reports `is_empty()` and is skipped.
+    ///
+    /// This matters because price stripping and neutralizing are a package:
+    /// stripping a price WITHOUT adding the compensating posting would leave
+    /// the transaction unbalanced.
+    #[test]
+    fn test_zero_basis_group_keeps_prices_and_gets_no_posting() {
+        let plugin = CurrencyAccountsPlugin::with_base_account("Equity:Currency".to_string());
+
+        // Two EUR postings that cancel, one carrying a price, plus a USD leg
+        // so there are two groups and the plugin engages.
+        let mut e1 = posting("Assets:Bank:EUR", "-100", "EUR");
+        e1.price = Some(price_usd("1.10"));
+        let e2 = posting("Assets:Other:EUR", "100", "EUR");
+        let u1 = posting("Assets:Bank:USD", "50", "USD");
+
+        let input = PluginInput {
+            directives: vec![txn_wrapper(
+                "2026-03-17",
+                "Zero EUR group",
+                vec![e1, e2, u1],
+            )],
+            options: default_options(),
+            config: None,
+        };
+        let input_dirs = input.directives.clone();
+        let output = plugin.process(input);
+        assert_eq!(output.errors.len(), 0);
+        let directives = materialize_ops(&input_dirs, &output);
+
+        let txn_dir = directives
+            .iter()
+            .find(|d| matches!(d.data, DirectiveData::Transaction(_)))
+            .expect("expected transaction");
+        let DirectiveData::Transaction(txn) = &txn_dir.data else {
+            unreachable!()
+        };
+
+        // No EUR currency account: that group's basis is -100 + 100 = 0.
+        assert!(
+            !txn.postings
+                .iter()
+                .any(|p| p.account == "Equity:Currency:EUR"),
+            "zero-basis group must not be neutralized: {:?}",
+            txn.postings.iter().map(|p| &p.account).collect::<Vec<_>>()
+        );
+        // And its price survives, because nothing compensates for removing it.
+        assert!(
+            txn.postings[0].price.is_some(),
+            "a skipped group keeps its price"
+        );
+        // The USD group is non-zero, so it IS neutralized.
+        let usd = txn
+            .postings
+            .iter()
+            .find(|p| p.account == "Equity:Currency:USD")
+            .expect("USD group should be neutralized");
+        assert_eq!(usd.units.as_ref().unwrap().number, "-50");
+        assert_eq!(usd.units.as_ref().unwrap().currency, "USD");
     }
 
     /// Cost-only transaction: grouping key is cost.currency, and the plugin
