@@ -1270,7 +1270,16 @@ pub fn interpolate_with_tolerance_map<S: std::hash::BuildHasher>(
         // `total = -residual * signum(units)` and `per_unit = total / |units|`.
         let signum = units_number.signum();
         let total = -residual * signum;
-        let per_unit = total / units_number.abs();
+        // `normalize()` strips trailing zeros the DIVISION invented.
+        // `rust_decimal` picks a non-minimal scale for an exact quotient —
+        // `900 / 1000` yields `0.90` (scale 2), not `0.9` — where Python's
+        // decimal follows the spec's "ideal exponent" rule and reduces an
+        // exact result. Those zeros are an artifact of the algorithm, and a
+        // cost of `0.90` claims a significant digit the quotient does not
+        // have; the solved cost is then rendered with it (`cost_number`).
+        // The VALUE is untouched, so `BookedCost`'s
+        // `per_unit x |units| == total` invariant still holds.
+        let per_unit = (total / units_number.abs()).normalize();
         if per_unit < Decimal::ZERO {
             // Beancount: "Cost is negative" — a lot cannot be acquired at a
             // negative cost (#1705 edge e14).
@@ -2706,7 +2715,17 @@ mod tests {
     /// Issue #1705: an augmenting `{}` posting with one balancing leg has
     /// its per-unit cost inferred from the residual (like beancount), not
     /// left with an empty cost basis. `1000 USD {}` + `-900 EUR` → the lot
-    /// is booked at 0.90 EUR/unit.
+    /// is booked at 0.9 EUR/unit.
+    ///
+    /// Also pins the quotient's SCALE. `rust_decimal` picks a non-minimal
+    /// scale for an exact quotient — `900 / 1000` is `0.90`, not `0.9` —
+    /// where Python's decimal reduces an exact result, so bean-query reports
+    /// `cost_number` as `0.9`. The extra zero claims a significant digit the
+    /// quotient does not have, and it is written into the posting.
+    ///
+    /// The scale assertion is load-bearing: `Decimal`'s `PartialEq` ignores
+    /// scale, so this test read `dec!(0.90)` and passed either way. A value
+    /// comparison alone cannot see this regression.
     #[test]
     fn test_interpolate_augmenting_empty_cost_inferred_from_residual() {
         use rustledger_core::{CostNumber, CostSpec};
@@ -2726,7 +2745,16 @@ mod tests {
         assert_eq!(cost.currency.as_deref(), Some("EUR"));
         match cost.number {
             Some(CostNumber::PerUnitFromTotal(b)) => {
-                assert_eq!(b.per_unit, dec!(0.90), "per-unit cost");
+                assert_eq!(b.per_unit, dec!(0.9), "per-unit cost");
+                assert_eq!(
+                    b.per_unit.scale(),
+                    1,
+                    "minimal scale — got {} (scale {})",
+                    b.per_unit,
+                    b.per_unit.scale()
+                );
+                // What reaches `cost_number` in BQL output.
+                assert_eq!(b.per_unit.to_string(), "0.9");
                 assert_eq!(b.total, dec!(900), "preserved total");
             }
             other => panic!("expected PerUnitFromTotal, got {other:?}"),
