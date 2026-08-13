@@ -42,6 +42,13 @@ impl AtMode {
     }
 }
 
+/// Widths `JOURNAL` applies to its payee and narration columns, matching
+/// beancount's `transform_journal` (`MAXWIDTH(payee, 48)` /
+/// `MAXWIDTH(narration, 80)`).
+const JOURNAL_PAYEE_MAXWIDTH: i64 = 48;
+/// See [`JOURNAL_PAYEE_MAXWIDTH`].
+const JOURNAL_NARRATION_MAXWIDTH: i64 = 80;
+
 impl Executor<'_> {
     /// Execute a SELECT query.
     pub(super) fn execute_select(&self, query: &SelectQuery) -> Result<QueryResult, QueryError> {
@@ -1010,15 +1017,37 @@ impl Executor<'_> {
                             AtMode::None | AtMode::Other => cumulative_balance.clone(),
                         };
 
-                        let row = vec![
-                            Value::Date(txn.date),
-                            Value::String(txn.flag.to_string()),
+                        // `JOURNAL` is defined by beancount as a SELECT whose
+                        // payee and narration go through `MAXWIDTH`
+                        // (`beanquery/compiler.py::transform_journal`:
+                        // `MAXWIDTH(payee, 48)`, `MAXWIDTH(narration, 80)`).
+                        // Skipping it let a single long narration widen the
+                        // column without bound — the command exists to give a
+                        // readable ledger view, and an 800-character memo
+                        // defeats that.
+                        // Propagate rather than substituting a fallback. The
+                        // arguments are fully controlled here — a string and a
+                        // width comfortably above the placeholder's own length
+                        // — so this cannot fail in practice; if it ever does,
+                        // that is a bug worth surfacing, not worth hiding
+                        // behind a silently emptied payee.
+                        let payee = Self::maxwidth_on_values(&[
                             Value::String(
                                 txn.payee
                                     .as_ref()
                                     .map_or_else(String::new, ToString::to_string),
                             ),
+                            Value::Integer(JOURNAL_PAYEE_MAXWIDTH),
+                        ])?;
+                        let narration = Self::maxwidth_on_values(&[
                             Value::String(txn.narration.to_string()),
+                            Value::Integer(JOURNAL_NARRATION_MAXWIDTH),
+                        ])?;
+                        let row = vec![
+                            Value::Date(txn.date),
+                            Value::String(txn.flag.to_string()),
+                            payee,
+                            narration,
                             Value::String(posting.account.to_string()),
                             position_value,
                             Value::Inventory(Box::new(balance_for_row)),
