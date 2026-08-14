@@ -234,7 +234,21 @@ fn normalized_parts(quantum: Decimal) -> (u32, i64) {
 fn quantize_to_exponent(value: Decimal, exponent: i64) -> Option<Decimal> {
     if exponent <= 0 {
         let dp = u32::try_from(-exponent).ok()?;
-        return Some(value.round_dp(dp));
+        // `rustledger_core::round_dp_python`, not a hand-rolled
+        // `round_dp` + `rescale`. Both differences from `round_dp` matter here
+        // and the canonical carries both:
+        //
+        //   * `round_dp` never pads UP, so a value coarser than the grid came
+        //     back unchanged — `(-100).round_dp(2)` is `-100`, not `-100.00`.
+        //     That is what left `option "inferred_tolerance_default"
+        //     "USD:0.01"` inert: it parsed, threaded, reached this function
+        //     and changed nothing.
+        //   * `round_dp` drops the SIGN when a small negative rounds to zero,
+        //     so a residual of `-0.004` on a 0.01 grid filled `0.00` where
+        //     Python fills `-0.00`. Quantized-to-zero fills are deliberately
+        //     kept (see the zero-residual prune below), so that is visible
+        //     output. Copilot's catch on #2052.
+        return Some(rustledger_core::round_dp_python(value, dp));
     }
     // Rounding to tens or coarser. Only reachable via a tolerance >= 0.5,
     // which needs `infer_tolerance_from_cost` on a high-priced commodity or
@@ -2331,6 +2345,92 @@ mod tests {
     /// full decimal position too coarse. The step below is finer than the
     /// tightest grid in play (0.0001) and the range spans several multiples
     /// of the widest (0.01), so exact midpoints are sampled.
+    /// `option "inferred_tolerance_default"` must actually reach the
+    /// interpolated value.
+    ///
+    /// It parsed, threaded into `TolerancePolicy`, reached
+    /// `transaction_tolerances` (which returns `{USD: 0.01}` here) and passed
+    /// every guard in `round_interpolated` — and then changed nothing,
+    /// because `quantize_to_exponent` used `round_dp`, which rounds DOWN to
+    /// at most `dp` places and never pads up. `(-100).round_dp(2)` is `-100`.
+    /// So the whole option was silently inert end to end.
+    ///
+    /// beancount 3.2.3 on this ledger fills `-100.00`; without the option it
+    /// fills `-100`, and both tools agree in that case. Asserts on
+    /// `to_string()` because `Decimal`'s `==` cannot see the scale that is
+    /// the entire subject.
+    #[test]
+    fn an_inferred_tolerance_default_quantizes_the_interpolated_amount() {
+        let txn = Transaction::new(rustledger_core::naive_date(2018, 1, 1).unwrap(), "t")
+            .with_flag('*')
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(100), "USD")))
+            .with_synthesized_posting(Posting::auto("Equity:O"));
+
+        let fill = |policy: &crate::TolerancePolicy| {
+            let result = crate::interpolate_with_tolerances(&txn, &policy.options())
+                .expect("fixture interpolates");
+            result
+                .transaction
+                .postings
+                .iter()
+                .find(|p| p.value.account == "Equity:O")
+                .and_then(|p| p.value.amount())
+                .expect("the elided posting is filled")
+                .number
+                .to_string()
+        };
+
+        let mut with_default = crate::TolerancePolicy::default();
+        with_default.defaults.insert("USD".to_string(), dec!(0.01));
+        assert_eq!(
+            fill(&with_default),
+            "-100.00",
+            "the option must land the fill on the 0.01 grid",
+        );
+
+        // Without it, no tolerance applies to a scale-0 amount and the fill
+        // keeps its natural scale — bean-query agrees here too.
+        assert_eq!(fill(&crate::TolerancePolicy::default()), "-100");
+    }
+
+    /// A residual that rounds ONTO zero keeps its sign, as Python does.
+    ///
+    /// The grid lands `-0.004` on zero, and `round_dp` drops the sign there —
+    /// so a hand-rolled `round_dp` + `rescale` filled `0.00` where beancount
+    /// fills `-0.00`. Verified against beancount 3.2.3 on the same ledger.
+    /// Quantized-to-zero fills are deliberately kept (the prune below only
+    /// removes EXACTLY-zero residuals), so this is visible output, not an
+    /// internal detail. Copilot's catch on #2052 — and the reason this path
+    /// calls `rustledger_core::round_dp_python` rather than re-deriving it.
+    #[test]
+    fn a_residual_rounding_onto_zero_keeps_its_sign() {
+        let txn = Transaction::new(rustledger_core::naive_date(2018, 1, 1).unwrap(), "t")
+            .with_flag('*')
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(100.004), "USD")))
+            .with_synthesized_posting(Posting::new("Assets:B", Amount::new(dec!(-100.000), "USD")))
+            .with_synthesized_posting(Posting::auto("Equity:O"));
+
+        let mut policy = crate::TolerancePolicy::default();
+        policy.defaults.insert("USD".to_string(), dec!(0.01));
+        let result =
+            crate::interpolate_with_tolerances(&txn, &policy.options()).expect("interpolates");
+
+        let filled = result
+            .transaction
+            .postings
+            .iter()
+            .find(|p| p.value.account == "Equity:O")
+            .and_then(|p| p.value.amount())
+            .expect("the elided posting is filled")
+            .number;
+
+        assert_eq!(
+            filled.to_string(),
+            "-0.00",
+            "a negative residual that rounds onto zero must keep its sign",
+        );
+    }
+
     #[test]
     fn rounding_error_never_exceeds_tolerance() {
         let quantum = dec!(0.01);
