@@ -732,8 +732,14 @@ impl Inventory {
             .get(&position.units.currency)
             .copied()
             .unwrap_or_default();
-        let new_cached = cached
-            .checked_add(position.units.number)
+        // Python `decimal` scale semantics, not raw `checked_add` — see
+        // `crate::decimal::add_python_scale`. `rust_decimal` returns the other
+        // operand untouched when one side is zero, so a running total that
+        // passes through zero drops its scale and everything added after it
+        // renders one scale narrower. That made a coalesced balance
+        // ORDER-DEPENDENT: the same postings in a different order produced
+        // `1` or `1.00` for the same money.
+        let new_cached = crate::decimal::checked_add_python_scale(cached, position.units.number)
             .ok_or_else(overflow)?;
 
         let merge_idx = position
@@ -743,11 +749,14 @@ impl Inventory {
             .flatten();
         let merged_units = merge_idx
             .map(|idx| {
-                self.positions[idx]
-                    .units
-                    .number
-                    .checked_add(position.units.number)
-                    .ok_or_else(overflow)
+                // Same rule as the units cache above — these two must agree,
+                // or `units()` and the position itself report different scales
+                // for the same currency.
+                crate::decimal::checked_add_python_scale(
+                    self.positions[idx].units.number,
+                    position.units.number,
+                )
+                .ok_or_else(overflow)
             })
             .transpose()?;
 
@@ -873,17 +882,26 @@ impl Inventory {
         self.units_cache.clear();
 
         for (idx, pos) in self.positions.iter().enumerate() {
-            // Update units cache for all positions. `checked_add`, not `+=`:
+            // Update units cache for all positions. Checked, not `+=`:
             // `Decimal`'s `+` panics on overflow, and this runs over payloads.
+            //
+            // Must apply the SAME Python-scale rule as `add`, not a raw
+            // `checked_add`. `units_cache` is `#[serde(skip)]`, so this is the
+            // path that reconstructs it after a round-trip; if the two
+            // disagreed, an inventory built incrementally and the same
+            // inventory deserialized would report different scales for the
+            // same money — measured at `1.00` built vs `1` rebuilt, across
+            // three cost lots summing through zero. Pinned by
+            // `a_round_trip_reports_the_same_scale_as_incremental_adds`.
             let slot = self
                 .units_cache
                 .entry(pos.units.currency.clone())
                 .or_default();
-            *slot = slot
-                .checked_add(pos.units.number)
-                .ok_or_else(|| OverflowError {
+            *slot = crate::decimal::checked_add_python_scale(*slot, pos.units.number).ok_or_else(
+                || OverflowError {
                     currency: pos.units.currency.clone(),
-                })?;
+                },
+            )?;
 
             // Update simple_index only for positions without cost
             if pos.cost.is_none() {
@@ -1599,6 +1617,109 @@ mod tests {
             .expect("fixture fits in Decimal");
         assert_eq!(inv.len(), 2); // Both lots kept
         assert_eq!(inv.units("AAPL"), dec!(0)); // Net units still zero
+    }
+
+    /// A deserialized inventory must report the same scale as one built by
+    /// incremental `add`s.
+    ///
+    /// `units_cache` is `#[serde(skip)]`, so `try_rebuild_index_from` is what
+    /// reconstructs it after a round-trip. That rebuild re-sums the positions;
+    /// if it used a raw `checked_add` while `add` used the Python scale rule,
+    /// the two would part company the moment the running sum crossed zero —
+    /// the same money reporting `1.00` from one path and `1` from the other,
+    /// silently, depending only on whether it had been serialized.
+    ///
+    /// Needs COST-BEARING lots. Cost-less positions coalesce into a single
+    /// position, and one position cannot cross zero during the rebuild, so a
+    /// simpler fixture passes either way and pins nothing.
+    #[test]
+    fn a_round_trip_reports_the_same_scale_as_incremental_adds() {
+        let mut inv = Inventory::new();
+        let lots = [
+            (
+                dec!(2.00),
+                Cost::new(dec!(10.00), "USD").with_date(date(2024, 1, 1)),
+            ),
+            (
+                dec!(-2.00),
+                Cost::new(dec!(11.00), "USD").with_date(date(2024, 1, 2)),
+            ),
+            (
+                dec!(1),
+                Cost::new(dec!(12.00), "USD").with_date(date(2024, 1, 3)),
+            ),
+        ];
+        for (units, cost) in lots {
+            inv.add(Position::with_cost(Amount::new(units, "SH"), cost))
+                .expect("fixture fits in Decimal");
+        }
+
+        let built = inv.units("SH").to_string();
+        assert_eq!(built, "1.00", "the incrementally-built total");
+
+        let json = serde_json::to_string(&inv).expect("serializes");
+        let round_tripped: Inventory = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(
+            round_tripped.units("SH").to_string(),
+            built,
+            "a serde round-trip must not change the reported scale",
+        );
+    }
+
+    /// Coalescing must not make a balance depend on the order it was built in.
+    ///
+    /// `rust_decimal` returns the other operand untouched when one side is
+    /// zero, so a running total that passes through zero loses its scale and
+    /// every later addend renders one scale narrower. The two inventories
+    /// below hold the SAME multiset of amounts in a different order.
+    ///
+    /// Asserts on `to_string()`, not on `Decimal` equality: `==` compares
+    /// value and ignores scale (`dec!(1) == dec!(1.00)`), so a value-level
+    /// assertion here would pass against the bug it is pinning.
+    #[test]
+    fn coalescing_is_independent_of_the_order_amounts_arrive_in() {
+        // Passes through 0.00 (scale 2), then takes a scale-0 addend.
+        let zero_crossing_first = [dec!(-2.00), dec!(2.00), dec!(-1)];
+        // Same amounts, no zero crossing before the scale-0 addend.
+        let zero_crossing_last = [dec!(-1), dec!(-2.00), dec!(2.00)];
+
+        let build = |amounts: &[Decimal]| {
+            let mut inv = Inventory::new();
+            for n in amounts {
+                inv.add(Position::simple(Amount::new(*n, "USD")))
+                    .expect("fixture fits in Decimal");
+            }
+            inv
+        };
+
+        let a = build(&zero_crossing_first);
+        let b = build(&zero_crossing_last);
+
+        // The merged POSITION.
+        assert_eq!(
+            a.positions()
+                .next()
+                .expect("one position")
+                .units
+                .number
+                .to_string(),
+            "-1.00",
+            "a total that passed through zero must keep the widest scale",
+        );
+        assert_eq!(
+            b.positions()
+                .next()
+                .expect("one position")
+                .units
+                .number
+                .to_string(),
+            "-1.00",
+        );
+
+        // And the units CACHE, which is maintained separately and would
+        // otherwise disagree with the position it summarizes.
+        assert_eq!(a.units("USD").to_string(), "-1.00");
+        assert_eq!(b.units("USD").to_string(), "-1.00");
     }
 
     #[test]
