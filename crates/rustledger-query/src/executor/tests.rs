@@ -1862,3 +1862,94 @@ fn sum_keeps_python_scale_when_the_running_total_passes_through_zero() {
         "SUM must keep the widest addend's scale (bean-query renders 0.00)",
     );
 }
+
+/// `AVG` follows Python `decimal` in both directions.
+///
+/// #2046 fixed AVG's accumulator, found it changed nothing observable
+/// because the division re-normalized the result, and reverted rather than
+/// ship a half-fix. The two halves land together here.
+///
+/// `rust_decimal` is wrong on each side of the ideal-exponent rule, so the
+/// fixture exercises both from one ledger:
+///
+/// * **Under** — the ungrouped average is `0.00 / 4`, which `rust_decimal`
+///   renders `0` (a zero dividend loses its scale).
+/// * **Over** — the per-account average is `-113.11 / 2`, which
+///   `rust_decimal` renders `-56.5550`, one trailing zero past what the
+///   ideal exponent allows.
+///
+/// Python gives `0.00` and `-56.555`; both were confirmed by running the
+/// arithmetic through `CPython`'s `decimal` rather than reasoned out.
+///
+/// Note this is NOT a compat pin: bean-query has no `avg(decimal)` at all
+/// (`no function matches "avg(decimal)"`), so nothing downstream forces the
+/// choice. It is here so AVG agrees with SUM and with `+` about the same
+/// arithmetic, and so the answer stops depending on addend order.
+#[test]
+fn avg_follows_python_decimal_scale_in_both_directions() {
+    let directives = vec![Directive::Transaction(
+        Transaction::new(date(2024, 1, 2), "one txn, four postings")
+            .with_flag('*')
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(-111.11), "USD")))
+            .with_synthesized_posting(Posting::new("Assets:B", Amount::new(dec!(111.11), "USD")))
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(-2), "USD")))
+            .with_synthesized_posting(Posting::new("Assets:B", Amount::new(dec!(2), "USD"))),
+    )];
+
+    let render = |sql: &str, row: usize, col: usize| {
+        let mut executor = Executor::new(&directives);
+        let query = parse(sql).unwrap();
+        let result = executor.execute(&query).unwrap();
+        let Value::Number(n) = &result.rows[row][col] else {
+            panic!("expected a Number, got {:?}", result.rows[row][col]);
+        };
+        n.to_string()
+    };
+
+    // Under-padding: the running total passes through `0.00`, so a plain
+    // `+=` would leave `0` here and the division would keep it.
+    assert_eq!(render("SELECT AVG(number)", 0, 0), "0.00");
+
+    // Over-padding: `-113.11 / 2` is exactly `-56.555`. `rust_decimal`'s
+    // division alone yields `-56.5550`.
+    assert_eq!(
+        render("SELECT account, AVG(number) GROUP BY account", 0, 1),
+        "-56.555",
+    );
+}
+
+/// BQL's `/` operator follows the same rule as AVG.
+///
+/// Unlike `avg(decimal)`, division DOES exist in bean-query, so this one is a
+/// compat surface and the divergence was user-visible in both directions:
+/// `0.00 / 4` rendered `0` against bean-query's `0.00`, and `7 / 2` rendered
+/// `3.50` against its `3.5`. Verified against bean-query 3.2.3 on each case
+/// below.
+///
+/// Leaving the operator on raw `checked_div` while AVG used the rule would
+/// have put two different answers for the same arithmetic in one engine.
+#[test]
+fn the_division_operator_matches_bean_query_scale() {
+    let directives = vec![Directive::Transaction(
+        Transaction::new(date(2024, 1, 2), "t")
+            .with_flag('*')
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(-1), "USD")))
+            .with_synthesized_posting(Posting::new("Assets:B", Amount::new(dec!(1), "USD"))),
+    )];
+
+    for (expr, want) in [
+        ("0.00 / 4", "0.00"),
+        ("0.000 / 3", "0.000"),
+        ("7 / 2", "3.5"),
+        ("1.00 / 2", "0.50"),
+        ("1 / 3", "0.3333333333333333333333333333"),
+    ] {
+        let mut executor = Executor::new(&directives);
+        let query = parse(&format!("SELECT {expr}")).unwrap();
+        let result = executor.execute(&query).unwrap();
+        let Value::Number(n) = &result.rows[0][0] else {
+            panic!("expected a Number for {expr}, got {:?}", result.rows[0][0]);
+        };
+        assert_eq!(n.to_string(), want, "{expr}");
+    }
+}
