@@ -890,7 +890,26 @@ impl<'a> Executor<'a> {
                             if &pos.units.currency != first_currency {
                                 return Ok(Value::Null);
                             }
-                            total += pos.units.number;
+                            // Python scale rule, same as SUM — see
+                            // `rustledger_core::add_python_scale`. This walks
+                            // a multi-lot inventory (cost-bearing lots are not
+                            // coalesced), so it is a real accumulation and
+                            // gets the same rule rather than a second
+                            // convention.
+                            //
+                            // Scope note, so this is not mistaken for a fix of
+                            // the visible symptom: no ledger is known that
+                            // makes THIS loop's own zero-crossing observable —
+                            // booking rejects the reductions that would build
+                            // one. The `0` vs `0.00` that `NUMBER(SUM(position))`
+                            // does show on a single-currency ledger comes from
+                            // further upstream, where `Inventory::add`
+                            // coalesces same-key lots with a plain
+                            // `checked_add` and drops the scale there. Fixing
+                            // that is a `rustledger-core` change read by every
+                            // balance surface (reports, FFI, BQL) and wants its
+                            // own compat sweep.
+                            total = rustledger_core::add_python_scale(total, pos.units.number);
                         }
                         Ok(Value::Number(total))
                     }

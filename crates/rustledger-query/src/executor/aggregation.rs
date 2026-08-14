@@ -331,11 +331,21 @@ impl<'a> Executor<'a> {
                                     has_positions = true;
                                 }
                                 Value::Number(n) => {
-                                    total_number += n;
+                                    // Python scale semantics, not `+=` — see
+                                    // `rustledger_core::add_python_scale`. A
+                                    // running total that passes through zero
+                                    // otherwise drops its scale and the column
+                                    // renders `0` where bean-query renders
+                                    // `0.00`.
+                                    total_number =
+                                        rustledger_core::add_python_scale(total_number, n);
                                     has_numbers = true;
                                 }
                                 Value::Integer(i) => {
-                                    total_number += Decimal::from(i);
+                                    total_number = rustledger_core::add_python_scale(
+                                        total_number,
+                                        Decimal::from(i),
+                                    );
                                     has_numbers = true;
                                 }
                                 Value::Null => {}
@@ -512,6 +522,15 @@ impl<'a> Executor<'a> {
                             let val = self.evaluate_expr(&func.args[0], ctx)?;
                             match val {
                                 Value::Number(n) => {
+                                    // NOTE: deliberately plain `+=`, unlike
+                                    // SUM above. Fixing AVG needs a DIVISION
+                                    // scale rule too — `rust_decimal` drops
+                                    // the dividend's scale on `0.00 / 4` (it
+                                    // yields `0`, Python yields `0.00`), so
+                                    // the accumulator alone changes nothing
+                                    // observable here. Tracked separately;
+                                    // bean-query has no `avg(decimal)` at all,
+                                    // so there is no compat pin either way.
                                     sum += n;
                                     count += 1;
                                 }
@@ -820,11 +839,21 @@ impl<'a> Executor<'a> {
                                     has_positions = true;
                                 }
                                 Value::Number(n) => {
-                                    total_number += n;
+                                    // Python scale semantics, not `+=` — see
+                                    // `rustledger_core::add_python_scale`. A
+                                    // running total that passes through zero
+                                    // otherwise drops its scale and the column
+                                    // renders `0` where bean-query renders
+                                    // `0.00`.
+                                    total_number =
+                                        rustledger_core::add_python_scale(total_number, n);
                                     has_numbers = true;
                                 }
                                 Value::Integer(i) => {
-                                    total_number += Decimal::from(i);
+                                    total_number = rustledger_core::add_python_scale(
+                                        total_number,
+                                        Decimal::from(i),
+                                    );
                                     has_numbers = true;
                                 }
                                 Value::Null => {}
@@ -946,6 +975,15 @@ impl<'a> Executor<'a> {
                                 self.evaluate_subquery_expr(&func.args[0], row, column_map)?;
                             match val {
                                 Value::Number(n) => {
+                                    // NOTE: deliberately plain `+=`, unlike
+                                    // SUM above. Fixing AVG needs a DIVISION
+                                    // scale rule too — `rust_decimal` drops
+                                    // the dividend's scale on `0.00 / 4` (it
+                                    // yields `0`, Python yields `0.00`), so
+                                    // the accumulator alone changes nothing
+                                    // observable here. Tracked separately;
+                                    // bean-query has no `avg(decimal)` at all,
+                                    // so there is no compat pin either way.
                                     sum += n;
                                     count += 1;
                                 }
