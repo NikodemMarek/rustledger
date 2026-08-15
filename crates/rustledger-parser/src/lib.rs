@@ -300,29 +300,23 @@ pub struct ParseResult {
     /// consume the cache to skip both the redundant parse and the
     /// redundant alignment walk.
     ///
-    /// **Producer-only cache invariant.** This field is populated
-    /// exactly once by `parse_via_cst`; the value is consistent with
-    /// the `directives` / `syntax_root` fields *at parse time*.
-    /// `ParseResult` exposes every cache input (`directives`,
-    /// `syntax_root`) as `pub`, so technically a consumer with a
-    /// `&mut ParseResult` can mutate one without refreshing the
-    /// other — leaving `alignment` stale. That is OUT-OF-CONTRACT
-    /// for this cache. Callers that mutate `ParseResult` directly
-    /// must either (a) refresh `alignment` by calling
-    /// `crate::format::compute_alignment(&SourceFile::cast(self.syntax_node()))`,
-    /// (b) avoid the `_with_alignment` formatter variants and use
-    /// the bare ones (which re-compute), or (c) treat the
-    /// `ParseResult` as immutable after construction (the common
-    /// case — the LSP wraps it in `Arc<ParseResult>`).
+    /// **Computed on first ask, then cached.** Nothing populates this at
+    /// parse time any more; the first call to [`ParseResult::alignment`]
+    /// computes it from `syntax_root` and every later call is free. Because
+    /// the value is derived from the tree WHEN ASKED rather than snapshotted
+    /// at parse time, the staleness hazard the old eager field carried — a
+    /// consumer mutating `directives` or `syntax_root` through their `pub`
+    /// handles and leaving a stale alignment behind — only exists if the
+    /// mutation happens after something already forced the cache.
     ///
     /// **Equivalence pinned.**
     /// `parse_result_alignment_cache::*` (7 fixtures) assert that
-    /// `parse(s).alignment` equals
+    /// `parse(s).alignment()` equals
     /// `compute_alignment(&SourceFile::cast(parse(s).syntax_node()).unwrap())`
-    /// across representative fixtures, so any future divergence
-    /// (a converter change that forgets to refresh the cache, a
-    /// `compute_alignment` change that breaks the contract)
-    /// fails CI.
+    /// across representative fixtures, so a `compute_alignment` change that
+    /// breaks the contract fails CI. `parse_leaves_the_alignment_uncomputed_until_asked`
+    /// separately pins that parsing does not force it — the value is the same
+    /// either way, so nothing else would notice the cost coming back.
     ///
     /// **Canonical-payload exclusion.** Excluded from
     /// [`__baseline_canonical_payload`] for the same reason as
@@ -333,7 +327,8 @@ pub struct ParseResult {
     /// non-default alignment (i.e. essentially every real
     /// Beancount file). The exclusion is pinned by
     /// `canonical_payload_excludes_alignment`.
-    pub alignment: crate::format::PostingAlignment,
+    /// Lazily computed; see [`ParseResult::alignment`].
+    alignment: std::sync::OnceLock<crate::format::PostingAlignment>,
 }
 
 impl ParseResult {
@@ -349,6 +344,51 @@ impl ParseResult {
     #[must_use]
     pub fn syntax_node(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.syntax_root.clone())
+    }
+
+    /// File-wide alignment columns the formatter would use, computed on
+    /// first call and cached.
+    ///
+    /// This used to be computed eagerly by every parse and stored as a
+    /// public field. `compute_alignment` walks the tree through the RED ast
+    /// accessors (`Posting::flag`, `Amount::is_arithmetic`, ...), and rowan
+    /// allocates a `Box<NodeData>` per red node with no recycling — so every
+    /// caller paid a full formatter pass whether or not it ever formatted
+    /// anything. Measured by ablation, it was 5.7%-12.3% of ALL instructions
+    /// depending on workload, and ~34% of the process's allocations.
+    ///
+    /// Only the formatter reads it (`format_source_with_parsed`, and through
+    /// it the LSP, `rledger format` and `doctor roundtrip`), so it is now
+    /// paid for by those callers alone. The caching contract they relied on
+    /// is unchanged: the first call computes, every later call is free, and
+    /// the value equals a fresh `compute_alignment` on the same tree — which
+    /// is what `parse_result_alignment_cache::*` pins.
+    ///
+    /// `OnceLock`, deliberately, not `OnceCell`: `ParseResult` is shared as
+    /// `Arc<ParseResult>` across the LSP's threads and there is a
+    /// compile-time assertion below that it stays `Send + Sync`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `syntax_root` is not a `SOURCE_FILE`, matching
+    /// [`crate::format::format_node_grouped`]. It always is — `parse_via_cst`
+    /// builds the root — and the alternative considered here, falling back to
+    /// `PostingAlignment::default()`, is worse than a panic: it would format
+    /// the whole file to the wrong columns while looking like it worked.
+    #[must_use]
+    pub fn alignment(&self) -> crate::format::PostingAlignment {
+        *self.alignment.get_or_init(|| {
+            use crate::cst::ast::AstNode as _;
+            // Precondition as in `format_node_grouped`, which panics on the
+            // same breach rather than guessing an alignment.
+            #[allow(clippy::expect_used)]
+            let source_file = crate::cst::ast::SourceFile::cast(self.syntax_node())
+                .expect("ParseResult::syntax_root is always a SOURCE_FILE");
+            crate::cst::format::compute_alignment(
+                &source_file,
+                crate::cst::format::GroupingStyle::default(),
+            )
+        })
     }
 }
 
@@ -707,6 +747,49 @@ mod canonical_payload_excludes_alignment {
     use super::{__baseline_canonical_payload, parse};
     use crate::cst::format::PostingAlignment;
 
+    /// `parse` must NOT compute the alignment.
+    ///
+    /// This is the whole point of the change and nothing else asserts it: the
+    /// value is identical either way, so an eager computation would be
+    /// invisible to every other test while costing 7.6%-12.4% of the
+    /// program's instructions depending on workload.
+    ///
+    /// Checks the cache is empty after `parse`, that asking fills it, and
+    /// that the answer still equals a fresh `compute_alignment` on the same
+    /// tree.
+    #[test]
+    fn parse_leaves_the_alignment_uncomputed_until_asked() {
+        use crate::cst::ast::AstNode as _;
+
+        let src = "\
+2024-01-15 * \"Coffee\"
+  Assets:Bank  -5.00 USD
+  Expenses:Food
+";
+        let parsed = parse(src);
+        assert!(
+            parsed.alignment.get().is_none(),
+            "parse computed the alignment eagerly — that is the cost this \
+             change removed, and it is invisible in output because the value \
+             is the same either way",
+        );
+
+        let asked = parsed.alignment();
+        assert!(
+            parsed.alignment.get().is_some(),
+            "asking must populate the cache",
+        );
+
+        let fresh = crate::cst::format::compute_alignment(
+            &crate::cst::ast::SourceFile::cast(parsed.syntax_node()).expect("root casts"),
+            crate::cst::format::GroupingStyle::default(),
+        );
+        assert_eq!(
+            asked, fresh,
+            "the lazily-computed value must equal a fresh computation",
+        );
+    }
+
     #[test]
     fn mutating_alignment_does_not_change_canonical_payload() {
         let src = "\
@@ -715,14 +798,22 @@ mod canonical_payload_excludes_alignment {
   Expenses:Food
 ";
         let parsed = parse(src);
-        let mut mutated = parse(src);
+        let mutated = parse(src);
         // Synthesize a different PostingAlignment value: bump number_col
         // by 100. Real-world alignment would never be this wide
         // for the fixture, so we get a guaranteed-different cache.
-        mutated.alignment = PostingAlignment {
-            number_col: parsed.alignment.number_col + 100,
-            number_width: parsed.alignment.number_width + 7,
-        };
+        //
+        // `set` rather than assignment now that the cache is a `OnceLock`.
+        // It succeeds precisely because `parse` no longer fills it — which is
+        // the point of this change, so a failure here would mean the eager
+        // computation came back.
+        mutated
+            .alignment
+            .set(PostingAlignment {
+                number_col: parsed.alignment().number_col + 100,
+                number_width: parsed.alignment().number_width + 7,
+            })
+            .expect("parse must leave the alignment cache empty");
 
         let payload_original = __baseline_canonical_payload(&parsed);
         let payload_mutated = __baseline_canonical_payload(&mutated);
@@ -757,13 +848,16 @@ mod parse_result_alignment_cache {
             .expect("ParseResult::syntax_node() must be a SOURCE_FILE");
         let fresh = compute_alignment(&source_file, crate::cst::format::GroupingStyle::default());
         assert_eq!(
-            result.alignment, fresh,
-            "ParseResult::alignment cache diverged from a fresh \
-             compute_alignment call for {label}: cache = {:?}, fresh = {:?}. \
-             Either parse_via_cst forgot to call compute_alignment, or \
-             compute_alignment's semantics changed without refreshing \
-             the cache in the converter.",
-            result.alignment, fresh,
+            result.alignment(),
+            fresh,
+            "ParseResult::alignment() diverged from a fresh \
+             compute_alignment call for {label}: cached = {:?}, fresh = {:?}. \
+             The accessor and this test must agree on how the alignment is \
+             derived from the tree — most likely the accessor's \
+             `GroupingStyle` no longer matches the one used here, or \
+             compute_alignment's semantics changed.",
+            result.alignment(),
+            fresh,
         );
     }
 
