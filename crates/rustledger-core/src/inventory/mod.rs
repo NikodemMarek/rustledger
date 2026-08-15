@@ -323,6 +323,174 @@ impl fmt::Display for AccountedBookingError {
 }
 
 impl std::error::Error for AccountedBookingError {}
+/// How an [`Inventory`] holds its positions.
+///
+/// The two backings exist because the two uses want opposite things, and a
+/// single choice was measurably wrong for one of them:
+///
+/// * **Booking** mutates an inventory constantly — `add`, and a `reduce` that
+///   filters, sorts and then indexes matched lots — and snapshots it only on
+///   the conditional overflow-rollback path. It wants contiguous storage:
+///   O(1) indexing and cache-friendly iteration.
+/// * **BQL's JOURNAL running balance** is only appended to, and is CLONED
+///   once per output row. It wants structural sharing: N snapshots costing
+///   O(base + sum of deltas) rather than O(N x base) (#1086 — measured at
+///   32.7 MB peak RSS for 2000 lots x 2000 rows; a contiguous clone per row
+///   holds ~2M positions instead).
+///
+/// Holding everything in the persistent vector made every reduction pay RRB
+/// costs: on a lot-heavy workload `imbl::Vector`'s iterator alone was ~13% of
+/// all instructions, and indexed access inside `reduce_ordered` is O(log M)
+/// per lookup rather than O(1). Holding everything contiguously reintroduces
+/// the #1086 blow-up. So the representation follows the use.
+#[derive(Debug, Clone)]
+enum PositionStore {
+    /// Contiguous — booking's working representation.
+    Owned(Vec<Position>),
+    /// Structurally shared — BQL's snapshot representation.
+    Shared(Vector<Position>),
+}
+
+/// Iterator over [`PositionStore`], as a stack-allocated enum.
+///
+/// Deliberately NOT `Box<dyn Iterator>`: `iter` is called from `units`,
+/// `merge`, `at_cost`, equality and every reduction pass, so boxing would put
+/// a heap allocation and a dynamic dispatch on paths this change exists to
+/// make cheaper. Copilot's catch on #2056.
+enum PositionStoreIter<'a> {
+    Owned(std::slice::Iter<'a, Position>),
+    Shared(imbl::vector::Iter<'a, Position, imbl::shared_ptr::DefaultSharedPtr>),
+}
+
+impl<'a> Iterator for PositionStoreIter<'a> {
+    type Item = &'a Position;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(i) => i.next(),
+            Self::Shared(i) => i.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Owned(i) => i.size_hint(),
+            Self::Shared(i) => i.size_hint(),
+        }
+    }
+}
+
+impl Default for PositionStore {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PositionStore {
+    fn iter(&self) -> PositionStoreIter<'_> {
+        match self {
+            Self::Owned(v) => PositionStoreIter::Owned(v.iter()),
+            Self::Shared(v) => PositionStoreIter::Shared(v.iter()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Shared(v) => v.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, i: usize) -> Option<&Position> {
+        match self {
+            Self::Owned(v) => v.get(i),
+            Self::Shared(v) => v.get(i),
+        }
+    }
+
+    fn push(&mut self, p: Position) {
+        match self {
+            Self::Owned(v) => v.push(p),
+            Self::Shared(v) => v.push_back(p),
+        }
+    }
+
+    fn remove(&mut self, i: usize) -> Position {
+        match self {
+            Self::Owned(v) => v.remove(i),
+            Self::Shared(v) => v.remove(i),
+        }
+    }
+
+    fn retain(&mut self, f: impl FnMut(&Position) -> bool) {
+        match self {
+            Self::Owned(v) => v.retain(f),
+            Self::Shared(v) => v.retain(f),
+        }
+    }
+
+    /// Switch to contiguous storage, cloning if not already `Owned`.
+    ///
+    /// `reduce` calls this, which ALSO discharges the uniqueness requirement
+    /// the old unconditional `self.positions.iter().cloned().collect()`
+    /// existed for: mutating a structurally-SHARED `imbl::Vector` in place
+    /// drives `imbl-sized-chunks`' copy-on-write into a use-after-free of the
+    /// interned `Arc<str>` inside `Position`. Materializing into a fresh
+    /// `Vec` leaves nothing shared to corrupt, at the same O(M) cost that
+    /// copy already paid — and every subsequent access in the reduction is
+    /// then contiguous instead of an RRB walk.
+    fn make_owned(&mut self) {
+        if let Self::Shared(v) = self {
+            *self = Self::Owned(v.iter().cloned().collect());
+        }
+    }
+}
+
+impl std::ops::Index<usize> for PositionStore {
+    type Output = Position;
+    fn index(&self, i: usize) -> &Position {
+        match self {
+            Self::Owned(v) => &v[i],
+            Self::Shared(v) => &v[i],
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for PositionStore {
+    fn index_mut(&mut self, i: usize) -> &mut Position {
+        match self {
+            Self::Owned(v) => &mut v[i],
+            Self::Shared(v) => &mut v[i],
+        }
+    }
+}
+
+impl FromIterator<Position> for PositionStore {
+    fn from_iter<I: IntoIterator<Item = Position>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+// Serialized as a plain sequence, identical for both backings — the wire
+// format does not encode which representation happens to be in use, and a
+// round-trip always lands in `Owned` (deserialization is followed by
+// `rebuild_index`, and a freshly-loaded inventory is about to be mutated far
+// more often than snapshotted).
+impl Serialize for PositionStore {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for PositionStore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::Owned(Vec::<Position>::deserialize(deserializer)?))
+    }
+}
 
 /// An inventory is a collection of positions.
 ///
@@ -364,9 +532,13 @@ impl std::error::Error for AccountedBookingError {}
 // referred to it by a name (`rebuild_caches`) that never existed. Now it does.
 #[serde(try_from = "InventoryWire")]
 pub struct Inventory {
-    /// Persistent (structurally-shared) RRB-tree-backed vector. Cloning
-    /// is O(1) (Arc bump on the tree root); `push_back` / indexed mutation
-    /// are O(log N) per op but share structure with previous versions.
+    /// Positions, in whichever backing suits this inventory's use — see
+    /// [`PositionStore`]. Contiguous (`Owned`) by default, which is what
+    /// booking wants; structurally shared (`Shared`) for the BQL running
+    /// balances that are cloned once per output row.
+    ///
+    /// The notes below describe the SHARED backing, and are why it still
+    /// exists:
     /// This is the critical property for JOURNAL-style row-per-snapshot
     /// patterns in BQL (issue #1086): N nested snapshots cost O(base + Σ
     /// deltas) memory instead of O(N · base), and the per-row clone cost
@@ -386,7 +558,7 @@ pub struct Inventory {
     /// downstream callers archiving `Inventory` directly will need to
     /// archive `Vec<Position>` themselves. Serde wire format is unchanged
     /// (sequence-typed, identical for both backings).
-    positions: Vector<Position>,
+    positions: PositionStore,
     /// Index for O(1) lookup of simple positions (no cost) by currency.
     /// Maps currency to position index in the `positions` vector.
     /// Not serialized - rebuilt on demand.
@@ -441,7 +613,7 @@ impl TryFrom<InventoryWire> for Inventory {
     /// deserialization error.
     fn try_from(wire: InventoryWire) -> Result<Self, Self::Error> {
         let mut inv = Self {
-            positions: wire.positions,
+            positions: PositionStore::Owned(wire.positions.into_iter().collect()),
             simple_index: FxHashMap::default(),
             units_cache: FxHashMap::default(),
         };
@@ -458,7 +630,7 @@ impl TryFrom<InventoryWire> for Inventory {
 impl PartialEq for Inventory {
     fn eq(&self, other: &Self) -> bool {
         // Only compare positions, not the index (which is derived data)
-        self.positions == other.positions
+        self.positions.iter().eq(other.positions.iter())
     }
 }
 
@@ -494,15 +666,42 @@ impl Inventory {
         self.positions.iter().collect()
     }
 
-    /// Get mutable access to the underlying positions vector.
+    /// Get mutable access to the underlying positions, contiguously.
     ///
-    /// Returns `&mut imbl::Vector<Position>` (was `&mut Vec<Position>`
-    /// before issue #1086). `imbl::Vector` supports the same surface
-    /// for `push_back`, `pop_back`, `retain`, indexed access, and
-    /// iteration — but mutations are O(log N) with structural sharing
-    /// instead of O(1) amortized.
-    pub const fn positions_mut(&mut self) -> &mut Vector<Position> {
-        &mut self.positions
+    /// Forces the contiguous backing first, so the caller gets a real
+    /// `&mut Vec<Position>` with O(1) indexing and amortized O(1) push. If
+    /// the inventory was using the structurally-shared backing — the BQL
+    /// snapshot representation, see [`Inventory::new_shared`] — that
+    /// conversion costs O(M) once and any sharing with earlier snapshots is
+    /// dropped for THIS inventory; the snapshots themselves are unaffected.
+    ///
+    /// (The backing enum is private, so this deliberately describes it in
+    /// prose rather than linking: a public doc cannot intra-doc-link a
+    /// private item, and `cargo doc -D warnings` rejects it.)
+    pub fn positions_mut(&mut self) -> &mut Vec<Position> {
+        self.positions.make_owned();
+        match &mut self.positions {
+            PositionStore::Owned(v) => v,
+            PositionStore::Shared(_) => unreachable!("make_owned just ran"),
+        }
+    }
+
+    /// An inventory whose positions are structurally SHARED.
+    ///
+    /// For accumulators that are cloned far more often than they are mutated
+    /// — BQL's JOURNAL running balance, which emits one snapshot per output
+    /// row. Cloning is O(1) and successive snapshots share structure, so N
+    /// rows cost O(base + sum of deltas) instead of O(N x base) (#1086).
+    ///
+    /// Everything else should use [`Inventory::new`]: the default contiguous
+    /// backing is what makes booking's `reduce` cheap, and `reduce` converts
+    /// to it anyway.
+    #[must_use]
+    pub fn new_shared() -> Self {
+        Self {
+            positions: PositionStore::Shared(Vector::new()),
+            ..Self::default()
+        }
     }
 
     /// Check if inventory is empty.
@@ -671,7 +870,7 @@ impl Inventory {
     ) -> Result<FxHashMap<crate::Currency, Decimal>, OverflowError> {
         let mut totals: FxHashMap<crate::Currency, Decimal> = FxHashMap::default();
 
-        for pos in &self.positions {
+        for pos in self.positions.iter() {
             if pos.units.currency == units_currency {
                 // NOT `pos.book_value()`: its `None` conflates "no cost" with
                 // "product out of range", and skipping the latter would drop a
@@ -776,14 +975,14 @@ impl Inventory {
             let idx = self.positions.len();
             self.simple_index
                 .insert(position.units.currency.clone(), idx);
-            self.positions.push_back(position);
+            self.positions.push(position);
             return Ok(());
         }
 
         // For positions with cost, just add as a new lot.
         // This is O(1) and keeps all lots separate, matching Python beancount behavior.
         // Lot aggregation for display purposes is handled separately in query output.
-        self.positions.push_back(position);
+        self.positions.push(position);
         Ok(())
     }
 
@@ -832,7 +1031,7 @@ impl Inventory {
         // profiler). Rebuilding from cloned positions restores a refcount-1
         // Vector with correct `Arc` refcounting, so in-place mutation below has
         // no shared chunk to corrupt.
-        self.positions = self.positions.iter().cloned().collect();
+        self.positions.make_owned();
 
         // {*} merge operator: merge all lots into a single weighted-average-cost
         // lot before reducing, regardless of the account's booking method.
@@ -928,7 +1127,7 @@ impl Inventory {
     /// [`OverflowError`] when a merged running total leaves `rust_decimal`'s
     /// range. `self` keeps the positions merged before the failure.
     pub fn merge(&mut self, other: &Self) -> Result<(), OverflowError> {
-        for pos in &other.positions {
+        for pos in other.positions.iter() {
             self.add(pos.clone())?;
         }
         Ok(())
@@ -948,7 +1147,7 @@ impl Inventory {
     pub fn at_cost(&self) -> Result<Self, OverflowError> {
         let mut result = Self::new();
 
-        for pos in &self.positions {
+        for pos in self.positions.iter() {
             if pos.is_empty() {
                 continue;
             }
@@ -984,7 +1183,7 @@ impl Inventory {
     pub fn at_units(&self) -> Result<Self, OverflowError> {
         let mut result = Self::new();
 
-        for pos in &self.positions {
+        for pos in self.positions.iter() {
             if pos.is_empty() {
                 continue;
             }
@@ -1102,6 +1301,63 @@ mod tests {
     /// `add_headroom_for` refuses to read an empty one. Both are checked: the
     /// defensive refusal stays as the second line of defense for any other way
     /// an inventory might reach that state (review catch on #1898).
+    /// `new_shared` must actually produce the shared backing, and a serde
+    /// round-trip must land back in `Owned`.
+    ///
+    /// Both are load-bearing and neither is visible from the public API: the
+    /// backing is a private enum, so nothing outside this module can observe
+    /// which one an inventory holds. Without this test, `new_shared` could
+    /// quietly return the contiguous backing and the only symptom would be
+    /// BQL's JOURNAL memory going from 31 MB back to 395 MB on a large
+    /// ledger — a regression no unit test would catch. Copilot's catch on
+    /// #2056.
+    #[test]
+    fn new_shared_is_shared_and_a_round_trip_is_owned() {
+        let mut shared = Inventory::new_shared();
+        assert!(
+            matches!(shared.positions, PositionStore::Shared(_)),
+            "new_shared must use the structurally-shared backing",
+        );
+
+        // Adding must not silently convert it — the per-row snapshot in BQL
+        // adds to this inventory between every clone.
+        shared
+            .add(Position::simple(Amount::new(dec!(5), "USD")))
+            .expect("fits");
+        assert!(
+            matches!(shared.positions, PositionStore::Shared(_)),
+            "add must keep the shared backing; converting here would restore \
+             the O(rows x lots) blow-up #1086 is about",
+        );
+
+        // ...but a reduction does convert, deliberately: it mutates heavily
+        // and wants contiguous storage.
+        let mut reduced = Inventory::new_shared();
+        reduced
+            .add(Position::simple(Amount::new(dec!(5), "USD")))
+            .expect("fits");
+        let _ = reduced.reduce(&Amount::new(dec!(-2), "USD"), None, BookingMethod::None);
+        assert!(
+            matches!(reduced.positions, PositionStore::Owned(_)),
+            "reduce must switch to the contiguous backing",
+        );
+
+        // The default constructor is contiguous.
+        assert!(matches!(
+            Inventory::new().positions,
+            PositionStore::Owned(_)
+        ));
+
+        // Serde carries a plain sequence and lands in `Owned`.
+        let json = serde_json::to_string(&shared).expect("serializes");
+        let back: Inventory = serde_json::from_str(&json).expect("deserializes");
+        assert!(
+            matches!(back.positions, PositionStore::Owned(_)),
+            "a round-trip lands in the contiguous backing",
+        );
+        assert_eq!(back.units("USD"), dec!(5), "and preserves the positions");
+    }
+
     #[test]
     fn a_deserialized_inventory_refuses_to_claim_headroom() {
         let mut inv = Inventory::new();
