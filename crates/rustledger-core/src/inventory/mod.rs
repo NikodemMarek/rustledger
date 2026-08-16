@@ -568,7 +568,81 @@ pub struct Inventory {
     /// Updated incrementally on `add()` and `reduce()`.
     /// Not serialized - rebuilt on demand.
     #[serde(skip)]
-    units_cache: FxHashMap<crate::Currency, Decimal>,
+    units_cache: FxHashMap<crate::Currency, CurrencyStats>,
+}
+
+/// Everything cached per currency: the running unit total, and the per-bucket
+/// position counts that make [`Inventory::is_reduced_by`] O(1).
+///
+/// Deliberately ONE map rather than two. `add` already did a `get` plus an
+/// `insert` on the units cache, and hanging a second map off the same key
+/// added a third hash of an interned string per posting — which measured as a
+/// 4% regression on the cost-spec-free `simple` profiling shape, wiping out
+/// part of what the index bought on `investment`. Folded in here, the counts
+/// ride along on a lookup that was already happening.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CurrencyStats {
+    /// Running total of units across every lot of this currency.
+    total: Decimal,
+    /// Position counts by (sign, cost-bearing) bucket.
+    counts: SignCounts,
+}
+
+/// How many positions of a currency fall in each (sign, cost-bearing) bucket.
+///
+/// Buckets keyed on `Decimal::is_sign_positive`, which is the exact predicate
+/// [`Inventory::is_reduced_by`] uses — note it answers `true` for zero, and
+/// the scan it replaces counted empty positions too, so this must as well.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SignCounts {
+    /// Cost-bearing lots whose units are sign-positive.
+    cost_positive: u32,
+    /// Cost-bearing lots whose units are sign-negative.
+    cost_negative: u32,
+    /// Cost-less lots whose units are sign-positive.
+    simple_positive: u32,
+    /// Cost-less lots whose units are sign-negative.
+    simple_negative: u32,
+}
+
+impl SignCounts {
+    /// Count of positions in the bucket opposite to `units_is_positive`.
+    const fn opposite(self, units_is_positive: bool, scope: ReductionScope) -> u32 {
+        let (cost, simple) = if units_is_positive {
+            (self.cost_negative, self.simple_negative)
+        } else {
+            (self.cost_positive, self.simple_positive)
+        };
+        match scope {
+            // Saturating, not `+`: these are counts of lots and a wrap would
+            // read as "no matching lot", which books a reduction as an
+            // augmentation and duplicates the lot. Saturation errs the other
+            // way, and `> 0` is all the caller asks.
+            ReductionScope::AllPositions => cost.saturating_add(simple),
+            ReductionScope::CostBearingOnly => cost,
+        }
+    }
+
+    /// `delta` is `i32` rather than `i64` so it feeds `saturating_add_signed`
+    /// directly. The earlier `i64` version ended in `try_into().unwrap_or(0)`,
+    /// which turns a caller mistake into a silent no-op — the one outcome that
+    /// leaves the counts wrong with nothing to show for it.
+    fn bump(&mut self, has_cost: bool, is_positive: bool, delta: i32) {
+        debug_assert!(
+            delta == 1 || delta == -1,
+            "counts move one lot at a time; {delta} means a caller lost track",
+        );
+        let slot = match (has_cost, is_positive) {
+            (true, true) => &mut self.cost_positive,
+            (true, false) => &mut self.cost_negative,
+            (false, true) => &mut self.simple_positive,
+            (false, false) => &mut self.simple_negative,
+        };
+        // Saturating: an under-count can only make `is_reduced_by` answer
+        // "not a reduction" and fall back to augmentation, where a wrapped
+        // u32 would claim billions of matching lots.
+        *slot = slot.saturating_add_signed(delta);
+    }
 }
 
 /// Where the positions a cache rebuild is reading came from.
@@ -678,6 +752,22 @@ impl Inventory {
     /// (The backing enum is private, so this deliberately describes it in
     /// prose rather than linking: a public doc cannot intra-doc-link a
     /// private item, and `cargo doc -D warnings` rejects it.)
+    ///
+    /// **Caches are the caller's problem here.** Mutating positions through
+    /// this handle leaves `units_cache` — both the running totals and the
+    /// sign counts — and `simple_index` describing the OLD contents. Those
+    /// drive `units()`, the reduction-vs-augmentation decision in
+    /// `is_reduced_by`, and cost-less merging in `add` respectively.
+    ///
+    /// [`Self::compact`] rebuilds all of them, but note that it ALSO drops
+    /// every empty position on the way through. If the caller deliberately
+    /// left a zero-unit lot in place, compacting to refresh the caches will
+    /// silently remove it — so that is a semantic change, not just a cache
+    /// refresh.
+    ///
+    /// Debug builds catch a missed rebuild through `is_reduced_by`'s
+    /// consistency assertion; release builds silently book against a stale
+    /// view.
     pub fn positions_mut(&mut self) -> &mut Vec<Position> {
         self.positions.make_owned();
         match &mut self.positions {
@@ -726,16 +816,26 @@ impl Inventory {
     /// Uses an internal cache for O(1) lookups.
     #[must_use]
     pub fn units(&self, currency: &str) -> Decimal {
-        // Use cache if available, otherwise compute and the caller should
-        // ensure cache is built via rebuild_caches() after deserialization
-        self.units_cache.get(currency).copied().unwrap_or_else(|| {
-            // Fallback to computation if cache miss (e.g., after deserialization)
-            self.positions
-                .iter()
-                .filter(|p| p.units.currency == currency)
-                .map(|p| p.units.number)
-                .sum()
-        })
+        // Use the cache when it is there. A miss is not a bug: the cache is
+        // `#[serde(skip)]`, and while deserialization rebuilds it (the
+        // `#[serde(try_from = "InventoryWire"]` on the struct), an inventory
+        // built some other way may not have one yet. Recomputing is O(lots)
+        // but always right.
+        //
+        // (This used to point callers at `rebuild_caches()`, which has never
+        // existed under that name — `rebuild_index` is the real one, and
+        // callers do not need it on the deserialize path any more.)
+        self.units_cache.get(currency).map_or_else(
+            || {
+                // Fallback to computation if cache miss (e.g., after deserialization)
+                self.positions
+                    .iter()
+                    .filter(|p| p.units.currency == currency)
+                    .map(|p| p.units.number)
+                    .sum()
+            },
+            |stats| stats.total,
+        )
     }
 
     /// Whether every `add` of `currency` totaling at most `needed` in absolute
@@ -779,7 +879,11 @@ impl Inventory {
                 .is_some_and(|sum| sum <= Decimal::MAX)
         };
 
-        let cached_ok = self.units_cache.get(currency).copied().is_none_or(fits);
+        let cached_ok = self
+            .units_cache
+            .get(currency)
+            .map(|s| s.total)
+            .is_none_or(fits);
         if !cached_ok {
             return false;
         }
@@ -821,6 +925,37 @@ impl Inventory {
     /// purchase/augmentation.
     #[must_use]
     pub fn is_reduced_by(&self, units: &Amount, scope: ReductionScope) -> bool {
+        // `units_cache` is `#[serde(skip)]` like `simple_index`. An empty
+        // one over non-empty positions means it has not been built yet, and
+        // reading it then would answer "not a reduction" for an inventory that
+        // holds matching lots — booking the posting as an augmentation and
+        // silently creating a duplicate lot. Fall back to the scan, as
+        // `units()` does for the same gap.
+        if self.units_cache.is_empty() && !self.positions.is_empty() {
+            return self.is_reduced_by_scan(units, scope);
+        }
+
+        let answer = self.units_cache.get(&units.currency).is_some_and(|stats| {
+            stats
+                .counts
+                .opposite(units.number.is_sign_positive(), scope)
+                > 0
+        });
+
+        // The index is maintained incrementally by `add` and the reduction
+        // commit paths; a missed update is a wrong answer, not a slow one.
+        debug_assert_eq!(
+            answer,
+            self.is_reduced_by_scan(units, scope),
+            "the cached sign counts disagree with a scan of positions — some \
+             mutation path changed a lot without maintaining them",
+        );
+        answer
+    }
+
+    /// The scan [`Self::is_reduced_by`] replaced, kept as the definition the
+    /// index is checked against and as the fallback for an unbuilt index.
+    fn is_reduced_by_scan(&self, units: &Amount, scope: ReductionScope) -> bool {
         self.positions.iter().any(|pos| {
             pos.units.currency == units.currency
                 && pos.units.number.is_sign_positive() != units.number.is_sign_positive()
@@ -929,7 +1064,7 @@ impl Inventory {
         let cached = self
             .units_cache
             .get(&position.units.currency)
-            .copied()
+            .map(|s| s.total)
             .unwrap_or_default();
         // Python `decimal` scale semantics, not raw `checked_add` — see
         // `crate::decimal::add_python_scale`. `rust_decimal` returns the other
@@ -959,8 +1094,54 @@ impl Inventory {
             })
             .transpose()?;
 
-        self.units_cache
-            .insert(position.units.currency.clone(), new_cached);
+        // Bucket changes, worked out before touching the cache so the whole
+        // update lands in ONE lookup below. A cost-less merge can flip the
+        // lot's sign (adding -8 to a +3 lot), which moves it between buckets;
+        // `is_sign_positive` answers true for zero, matching the predicate
+        // `is_reduced_by` uses.
+        let vacated = merge_idx.map(|idx| {
+            let lot = &self.positions[idx];
+            (lot.cost.is_some(), lot.units.number.is_sign_positive())
+        });
+        let occupied = (
+            position.cost.is_some(),
+            merged_units
+                .unwrap_or(position.units.number)
+                .is_sign_positive(),
+        );
+
+        // ONE mutable lookup for the total AND the counts. `add` runs once per
+        // posting, and the units cache is keyed by an interned string whose
+        // `Hash` walks its bytes — this used to be a `get` plus an `insert`,
+        // and hanging the counts off a second map made it three hashes per
+        // posting, which measured as a regression on ledgers that book no
+        // cost specs. `get_mut` first so only a currency's first lot pays for
+        // an owned key.
+        if let Some(stats) = self.units_cache.get_mut(&position.units.currency) {
+            stats.total = new_cached;
+            if let Some((had_cost, was_positive)) = vacated {
+                stats.counts.bump(had_cost, was_positive, -1);
+            }
+            stats.counts.bump(occupied.0, occupied.1, 1);
+        } else {
+            // No entry yet means no lot of this currency has ever been added,
+            // so there is nothing to vacate: `merge_idx` came from
+            // `simple_index`, which only names a lot that `add` already
+            // counted.
+            debug_assert!(
+                vacated.is_none(),
+                "merging into a lot whose currency has no cached entry",
+            );
+            let mut counts = SignCounts::default();
+            counts.bump(occupied.0, occupied.1, 1);
+            self.units_cache.insert(
+                position.units.currency.clone(),
+                CurrencyStats {
+                    total: new_cached,
+                    counts,
+                },
+            );
+        }
 
         // For positions without cost, use index for O(1) lookup
         if position.cost.is_none() {
@@ -984,6 +1165,36 @@ impl Inventory {
         // Lot aggregation for display purposes is handled separately in query output.
         self.positions.push(position);
         Ok(())
+    }
+
+    /// Adjust `sign_index` for the position currently at `idx` by `delta`.
+    ///
+    /// Called with `-1` before changing or removing a lot and `+1` after, so
+    /// a sign flip lands in the right bucket.
+    pub(super) fn sign_index_bump(&mut self, idx: usize, delta: i32) {
+        // All three call sites pass an index they just read or wrote, so this
+        // is defensive only. Returning rather than panicking keeps a future
+        // caller's off-by-one out of the panic path; the counts then disagree
+        // with a scan, which `is_reduced_by`'s assertion reports in debug.
+        debug_assert!(
+            idx < self.positions.len(),
+            "sign_index_bump called with out-of-range index {idx}",
+        );
+        let Some(position) = self.positions.get(idx) else {
+            return;
+        };
+        // Read the two bits the bucket depends on and drop the borrow. Cloning
+        // the `Position` here instead — which is what the obvious version does
+        // to satisfy the borrow checker — costs an `Arc` bump per currency plus
+        // the lot's label on EVERY add, and this runs on the hot path.
+        let has_cost = position.cost.is_some();
+        let is_positive = position.units.number.is_sign_positive();
+        if let Some(stats) = self.units_cache.get_mut(&position.units.currency) {
+            stats.counts.bump(has_cost, is_positive, delta);
+        }
+        // No entry means no lots of this currency have been counted yet, which
+        // only happens before `add` records the total. `add` inserts the entry
+        // before calling this, and the rebuild path fills both together.
     }
 
     /// Reduce positions from the inventory using the specified booking method.
@@ -1111,11 +1322,12 @@ impl Inventory {
                 .units_cache
                 .entry(pos.units.currency.clone())
                 .or_default();
-            *slot = crate::decimal::checked_add_python_scale(*slot, pos.units.number).ok_or_else(
-                || OverflowError {
+            slot.counts
+                .bump(pos.cost.is_some(), pos.units.number.is_sign_positive(), 1);
+            slot.total = crate::decimal::checked_add_python_scale(slot.total, pos.units.number)
+                .ok_or_else(|| OverflowError {
                     currency: pos.units.currency.clone(),
-                },
-            )?;
+                })?;
 
             // Update simple_index only for positions without cost
             if pos.cost.is_none() {
@@ -3496,5 +3708,248 @@ mod tests {
             rendered.contains("Assets:Cash"),
             "must contain account name: {rendered}"
         );
+    }
+
+    /// `sign_index` must agree with a scan after EVERY mutation path, not
+    /// just the ones a given test happens to follow with an
+    /// `is_reduced_by` call.
+    ///
+    /// `is_reduced_by`'s own `debug_assert` compares the two on every call,
+    /// which covers the whole suite — but only where something calls it.
+    /// This walks the mutations that can move a lot between buckets and
+    /// checks after each: a cost-less merge that flips a lot's sign by adding
+    /// through zero, a reduction that takes a lot to exactly zero (removing
+    /// it), and a partial reduction that leaves it. The comparison is
+    /// explicit rather than leaning on the assertion, so it holds in release
+    /// builds too.
+    #[test]
+    fn the_sign_index_tracks_every_mutation_path() {
+        let usd = Amount::new(dec!(1), "USD");
+        let aapl = Amount::new(dec!(1), "AAPL");
+        let check = |inv: &Inventory, label: &str| {
+            // The incrementally maintained counts must equal what a fresh
+            // rebuild computes. This is the invariant that matters, and it is
+            // strictly stronger than "the answers agree": an empty cache
+            // still ANSWERS correctly, because `is_reduced_by` falls back to
+            // the scan — so a path that quietly stopped maintaining the counts
+            // would restore the O(lots) cost with every test still green.
+            // Comparing against a rebuild catches that, and catches a broken
+            // rebuild too, since the two are independent code.
+            //
+            // Zero-count entries are filtered from both sides: `units_cache`
+            // keeps a currency's entry for its running total after the last
+            // lot closes, which a rebuild has no reason to create.
+            let counts_of = |inv: &Inventory| {
+                inv.units_cache
+                    .iter()
+                    .filter(|(_, stats)| stats.counts != SignCounts::default())
+                    .map(|(currency, stats)| (currency.as_str().to_string(), stats.counts))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let mut rebuilt = inv.clone();
+            rebuilt.rebuild_index();
+            assert_eq!(
+                counts_of(inv),
+                counts_of(&rebuilt),
+                "the incrementally maintained sign counts diverged from a \
+                 fresh rebuild after {label}",
+            );
+            for units in [&usd, &aapl] {
+                for signed in [
+                    units.clone(),
+                    Amount::new(-units.number, units.currency.clone()),
+                ] {
+                    for scope in [
+                        ReductionScope::AllPositions,
+                        ReductionScope::CostBearingOnly,
+                    ] {
+                        assert_eq!(
+                            inv.is_reduced_by(&signed, scope),
+                            inv.is_reduced_by_scan(&signed, scope),
+                            "the sign counts disagree with a scan after {label} \
+                         for {signed:?} / {scope:?}",
+                        );
+                    }
+                }
+            }
+        };
+
+        let mut inv = Inventory::new();
+        check(&inv, "empty");
+
+        // Cost-less lot, then a merge that takes it negative through zero.
+        inv.add(Position::simple(Amount::new(dec!(3), "USD")))
+            .expect("fits");
+        check(&inv, "one simple lot");
+        inv.add(Position::simple(Amount::new(dec!(-8), "USD")))
+            .expect("fits");
+        check(&inv, "simple lot flipped negative by merge");
+        inv.add(Position::simple(Amount::new(dec!(8), "USD")))
+            .expect("fits");
+        check(&inv, "simple lot flipped back positive");
+
+        // Cost-bearing lots, then reductions that partially and fully drain.
+        let cost = Cost::new(dec!(100), "USD");
+        inv.add(Position::with_cost(
+            Amount::new(dec!(10), "AAPL"),
+            cost.clone(),
+        ))
+        .expect("fits");
+        check(&inv, "one cost-bearing lot");
+
+        inv.reduce(
+            &Amount::new(dec!(-4), "AAPL"),
+            Some(&CostSpec::default()),
+            BookingMethod::Fifo,
+        )
+        .expect("partial reduction");
+        check(&inv, "partially reduced lot");
+
+        inv.reduce(
+            &Amount::new(dec!(-6), "AAPL"),
+            Some(&CostSpec::default()),
+            BookingMethod::Fifo,
+        )
+        .expect("full reduction");
+        check(&inv, "fully drained lot");
+
+        // STRICT with a single matching lot takes the OTHER commit path —
+        // `commit_from_lot`, which maintains the caches incrementally instead
+        // of rebuilding. A FIFO-only test leaves it completely uncovered.
+        let mut strict = Inventory::new();
+        strict
+            .add(Position::with_cost(
+                Amount::new(dec!(10), "AAPL"),
+                cost.clone(),
+            ))
+            .expect("fits");
+        check(&strict, "strict: one lot");
+        strict
+            .reduce(
+                &Amount::new(dec!(-4), "AAPL"),
+                Some(&CostSpec::default()),
+                BookingMethod::Strict,
+            )
+            .expect("partial strict reduction");
+        check(&strict, "strict: partially reduced");
+        strict
+            .reduce(
+                &Amount::new(dec!(-6), "AAPL"),
+                Some(&CostSpec::default()),
+                BookingMethod::Strict,
+            )
+            .expect("draining strict reduction");
+        check(&strict, "strict: lot drained and removed");
+        assert!(
+            strict.positions.is_empty(),
+            "the fixture must actually remove the lot, or the removal path is \
+             untested",
+        );
+
+        // A SHORT lot covered to exactly zero. This is the only shape where a
+        // reduction changes a lot's bucket: `is_sign_positive` answers TRUE
+        // for zero, so a negative lot reaching 0 moves from the negative
+        // bucket to the positive one in the instant before it is removed.
+        // Skipping the reclassify then decrements the wrong bucket and leaves
+        // the index claiming a short lot that no longer exists. A long lot
+        // cannot show this — it is capped at zero from above and never leaves
+        // the positive bucket.
+        let mut short = Inventory::new();
+        short
+            .add(Position::with_cost(
+                Amount::new(dec!(-5), "AAPL"),
+                Cost::new(dec!(100), "USD"),
+            ))
+            .expect("fits");
+        check(&short, "short: one negative lot");
+        short
+            .reduce(
+                &Amount::new(dec!(5), "AAPL"),
+                Some(&CostSpec::default()),
+                BookingMethod::Strict,
+            )
+            .expect("covering the short");
+        check(&short, "short: covered to zero and removed");
+        assert!(
+            short.positions.is_empty(),
+            "the short must actually close, or the bucket flip is untested",
+        );
+
+        // And a rebuild must land on the same state as the incremental path.
+        // Captured from an inventory whose last mutation was `commit_from_lot`
+        // (no rebuild), so the two are genuinely independent here.
+        let mut incremental_inv = Inventory::new();
+        incremental_inv
+            .add(Position::with_cost(Amount::new(dec!(10), "AAPL"), cost))
+            .expect("fits");
+        incremental_inv
+            .reduce(
+                &Amount::new(dec!(-4), "AAPL"),
+                Some(&CostSpec::default()),
+                BookingMethod::Strict,
+            )
+            .expect("partial strict reduction");
+        let incremental = incremental_inv.units_cache.clone();
+        assert!(!incremental.is_empty(), "fixture holds a lot");
+        incremental_inv.rebuild_index();
+        assert_eq!(
+            incremental, incremental_inv.units_cache,
+            "the incrementally maintained index must equal a fresh rebuild",
+        );
+    }
+
+    /// An inventory whose caches were never built still answers
+    /// `is_reduced_by` correctly.
+    ///
+    /// The caches are `#[serde(skip)]`. Deserialization rebuilds them, but
+    /// `positions_mut` hands out the position vector directly, so an
+    /// inventory CAN hold lots with an empty cache. Reading the counts then
+    /// would answer "not a reduction" for an inventory that plainly holds a
+    /// matching lot — booking a sale as a purchase and duplicating the lot,
+    /// which is the #875-class bug this predicate exists to prevent.
+    ///
+    /// So the unbuilt case falls back to the scan. This is the only test that
+    /// reaches that branch: every other route into `is_reduced_by` goes
+    /// through `add` or a rebuild, both of which populate the cache.
+    #[test]
+    fn an_unbuilt_cache_falls_back_to_the_scan_rather_than_answering_no() {
+        let mut inv = Inventory::new();
+        inv.positions_mut().push(Position::with_cost(
+            Amount::new(dec!(10), "AAPL"),
+            Cost::new(dec!(100), "USD"),
+        ));
+        assert!(
+            inv.units_cache.is_empty(),
+            "the fixture must reach `is_reduced_by` with an unbuilt cache, or \
+             it is testing the fast path instead",
+        );
+
+        assert!(
+            inv.is_reduced_by(
+                &Amount::new(dec!(-4), "AAPL"),
+                ReductionScope::CostBearingOnly
+            ),
+            "a sale against a held lot must be seen as a reduction even with \
+             no cache built",
+        );
+        assert!(
+            !inv.is_reduced_by(
+                &Amount::new(dec!(4), "AAPL"),
+                ReductionScope::CostBearingOnly
+            ),
+            "a purchase in the same direction is still an augmentation",
+        );
+
+        // And once the caches are built, the answers are unchanged.
+        inv.rebuild_index();
+        assert!(!inv.units_cache.is_empty(), "rebuild populates the cache");
+        assert!(inv.is_reduced_by(
+            &Amount::new(dec!(-4), "AAPL"),
+            ReductionScope::CostBearingOnly
+        ));
+        assert!(!inv.is_reduced_by(
+            &Amount::new(dec!(4), "AAPL"),
+            ReductionScope::CostBearingOnly
+        ));
     }
 }
