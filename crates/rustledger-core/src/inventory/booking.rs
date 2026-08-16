@@ -1011,17 +1011,46 @@ impl Inventory {
             stats.total = crate::decimal::add_python_scale(stats.total, units.number);
         }
 
-        // Remove if empty and rebuild simple_index
+        // Remove if empty, then repair `simple_index`.
         if self.positions[idx].is_empty() {
             self.sign_index_bump(idx, -1);
             self.positions.remove(idx);
-            // Only rebuild simple_index when position is removed
-            self.simple_index.clear();
-            for (i, p) in self.positions.iter().enumerate() {
-                if p.cost.is_none() {
-                    self.simple_index.insert(p.units.currency.clone(), i);
+
+            // Removing shifts every later position down one, so the stored
+            // indices past `idx` are now off by one. Patch the MAP rather than
+            // rescanning the positions to rebuild it.
+            //
+            // `simple_index` holds at most one entry per currency — cost-less
+            // lots of a currency merge into a single lot — so this is O(number
+            // of currencies), against O(lots) for the rescan it replaces. On
+            // an investment account, where every lot carries a cost and the
+            // map is EMPTY, the rescan walked the entire lot list to find
+            // nothing at all; it grew 164x for 10x the input on the
+            // `investment` profiling shape.
+            //
+            // The removed lot CAN be the cost-less lot this map names: an
+            // empty cost spec matches a cost-less position
+            // (`matches_cost_spec`: `(None, true) => true`), so STRICT selects
+            // one and drains it. An earlier version of this asserted the
+            // opposite and handled only the shift, which left the map pointing
+            // at a removed index — the next cost-less `add` then merged into a
+            // lot that was no longer there, or indexed past the end. Caught in
+            // review on #2063; pinned by
+            // `removing_a_cost_less_lot_drops_its_index_entry`.
+            //
+            // One pass: drop the entry naming the removed lot, shift the rest.
+            // (`>` vs `>=` here is an equivalent mutation — the `== idx` arm
+            // returns first, so no entry equal to `idx` ever reaches it. A
+            // mutation swapping them survives, and that is not a gap.)
+            self.simple_index.retain(|_, stored| {
+                if *stored == idx {
+                    return false;
                 }
-            }
+                if *stored > idx {
+                    *stored -= 1;
+                }
+                true
+            });
         }
     }
 }

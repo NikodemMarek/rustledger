@@ -3952,4 +3952,90 @@ mod tests {
             ReductionScope::CostBearingOnly
         ));
     }
+
+    /// Removing a drained lot shifts every later position down one, and
+    /// `simple_index` stores POSITIONS BY INDEX — so a cost-less lot sitting
+    /// after the removed one must have its stored index repaired.
+    ///
+    /// Get this wrong and `add` merges a later cost-less deposit into the
+    /// wrong lot, or indexes past the end. Nothing else in the suite covers
+    /// it: it needs a cost-bearing lot and a cost-less lot in the same
+    /// inventory, with the cost-bearing one removed first, and inventories in
+    /// most tests hold only one kind.
+    #[test]
+    fn removing_a_lot_repairs_the_index_of_a_later_cost_less_lot() {
+        let mut inv = Inventory::new();
+        // Index 0: cost-bearing. Index 1: cost-less, so `simple_index` says 1.
+        inv.add(Position::with_cost(
+            Amount::new(dec!(10), "AAPL"),
+            Cost::new(dec!(100), "USD"),
+        ))
+        .expect("fits");
+        inv.add(Position::simple(Amount::new(dec!(50), "USD")))
+            .expect("fits");
+        assert_eq!(
+            inv.simple_index.get(&crate::Currency::new("USD")),
+            Some(&1),
+            "fixture must put the cost-less lot second, or the shift is untested",
+        );
+
+        // Drain the cost-bearing lot. STRICT takes the single-lot commit path,
+        // which removes in place rather than rebuilding.
+        inv.reduce(
+            &Amount::new(dec!(-10), "AAPL"),
+            Some(&CostSpec::default()),
+            BookingMethod::Strict,
+        )
+        .expect("drains the lot");
+
+        assert_eq!(
+            inv.simple_index.get(&crate::Currency::new("USD")),
+            Some(&0),
+            "the cost-less lot moved to index 0 and the index must follow it",
+        );
+
+        // The consequence a stale index actually has: this must MERGE into the
+        // existing lot, not append a second one.
+        inv.add(Position::simple(Amount::new(dec!(25), "USD")))
+            .expect("fits");
+        assert_eq!(
+            inv.positions().count(),
+            1,
+            "a stale simple_index appends a duplicate cost-less lot instead of \
+             merging",
+        );
+        assert_eq!(inv.units("USD"), dec!(75));
+    }
+
+    /// Reducing a COST-LESS lot to zero removes it, and `simple_index` points
+    /// at exactly that lot — so the entry must go, not just shift.
+    #[test]
+    fn removing_a_cost_less_lot_drops_its_index_entry() {
+        let mut inv = Inventory::new();
+        inv.add(Position::simple(Amount::new(dec!(50), "USD")))
+            .expect("fits");
+        assert_eq!(inv.simple_index.get(&crate::Currency::new("USD")), Some(&0));
+
+        // An empty spec matches a cost-less lot (`matches_cost_spec`:
+        // `(None, true) => true`), so STRICT selects it and drains it.
+        inv.reduce(
+            &Amount::new(dec!(-50), "USD"),
+            Some(&CostSpec::default()),
+            BookingMethod::Strict,
+        )
+        .expect("drains the cost-less lot");
+
+        assert!(inv.positions().next().is_none(), "the lot is gone");
+        assert_eq!(
+            inv.simple_index.get(&crate::Currency::new("USD")),
+            None,
+            "a stale entry points at a removed lot; the next cost-less add \
+             indexes past the end",
+        );
+
+        // The consequence: this must not panic and must create a fresh lot.
+        inv.add(Position::simple(Amount::new(dec!(20), "USD")))
+            .expect("fits");
+        assert_eq!(inv.units("USD"), dec!(20));
+    }
 }
