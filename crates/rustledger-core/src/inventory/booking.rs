@@ -197,8 +197,7 @@ impl Inventory {
     ) -> Result<(BookingResult, ReductionPlan), BookingError> {
         let matching_indices: Vec<usize> = self
             .positions
-            .iter()
-            .enumerate()
+            .iter_slots()
             .filter(|(_, p)| {
                 p.units.currency == units.currency
                     && !p.is_empty()
@@ -270,8 +269,7 @@ impl Inventory {
     ) -> Result<BookingResult, BookingError> {
         let matching_indices: Vec<usize> = self
             .positions
-            .iter()
-            .enumerate()
+            .iter_slots()
             .filter(|(_, p)| {
                 p.units.currency == units.currency
                     && !p.is_empty()
@@ -353,8 +351,7 @@ impl Inventory {
         // Get matching positions with their costs
         let mut matching: Vec<(usize, Decimal)> = self
             .positions
-            .iter()
-            .enumerate()
+            .iter_slots()
             .filter(|(_, p)| {
                 p.units.currency == units.currency
                     && !p.is_empty()
@@ -491,8 +488,7 @@ impl Inventory {
         // Get indices of matching positions
         let mut indices: Vec<usize> = self
             .positions
-            .iter()
-            .enumerate()
+            .iter_slots()
             .filter(|(_, p)| {
                 p.units.currency == units.currency
                     && !p.is_empty()
@@ -786,8 +782,7 @@ impl Inventory {
         // This prevents accidentally netting long and short positions.
         let matching: Vec<(usize, &Position)> = self
             .positions
-            .iter()
-            .enumerate()
+            .iter_slots()
             .filter(|(_, p)| {
                 p.units.currency == units.currency
                     && !p.is_empty()
@@ -849,12 +844,8 @@ impl Inventory {
         // Remove all matching lots of this currency
         let matching_indices: std::collections::HashSet<usize> =
             matching.iter().map(|(i, _)| *i).collect();
-        let mut idx = 0;
-        self.positions.retain(|_| {
-            let keep = !matching_indices.contains(&idx);
-            idx += 1;
-            keep
-        });
+        self.positions
+            .retain_slots(|slot, _| !matching_indices.contains(&slot));
 
         // Add back a single merged lot with the remainder
         let remaining = total_units + units.number; // units.number is negative for reductions

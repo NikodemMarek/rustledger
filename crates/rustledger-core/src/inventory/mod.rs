@@ -387,6 +387,23 @@ impl Default for PositionStore {
 }
 
 impl PositionStore {
+    /// Every live position paired with the index that [`Index`] will accept
+    /// for it.
+    ///
+    /// Today this is exactly `iter().enumerate()`, because every element of
+    /// the backing store is live. It exists as its own method because that
+    /// equivalence is a PROPERTY OF THE CURRENT STORAGE, not a law: the
+    /// reduction paths collect indices here and hand them back through
+    /// `Index`/`IndexMut`, so anything that makes the backing sparse — the
+    /// tombstoned lots that would let a cost-keyed index survive removals —
+    /// silently desynchronises the two unless every such site goes through
+    /// one place. This is that place.
+    ///
+    /// [`Index`]: std::ops::Index
+    fn iter_slots(&self) -> impl Iterator<Item = (usize, &Position)> {
+        self.iter().enumerate()
+    }
+
     fn iter(&self) -> PositionStoreIter<'_> {
         match self {
             Self::Owned(v) => PositionStoreIter::Owned(v.iter()),
@@ -431,6 +448,29 @@ impl PositionStore {
             Self::Owned(v) => v.retain(f),
             Self::Shared(v) => v.retain(f),
         }
+    }
+
+    /// [`Self::retain`], with each position's slot index — the same index
+    /// [`Self::iter_slots`] reports and [`Index`] accepts.
+    ///
+    /// `reduce_merge` needs this: it selects lots through `iter_slots` and
+    /// then drops exactly those. Written with a plain `retain` and a counter
+    /// incremented per visit, that is only correct while every element the
+    /// store holds is a live position visited in order — the same dense-store
+    /// assumption `iter_slots` exists to keep in one place, arriving by a
+    /// second route that `iter_slots` cannot cover. A sparse store whose
+    /// `retain` skips dead slots would leave the counter numbering live
+    /// positions while the selection numbered real slots, and `{*}` merges
+    /// would delete the wrong lots.
+    ///
+    /// [`Index`]: std::ops::Index
+    fn retain_slots(&mut self, mut f: impl FnMut(usize, &Position) -> bool) {
+        let mut slot = 0;
+        self.retain(|position| {
+            let keep = f(slot, position);
+            slot += 1;
+            keep
+        });
     }
 
     /// Switch to contiguous storage, cloning if not already `Owned`.
@@ -1306,7 +1346,7 @@ impl Inventory {
         self.simple_index.clear();
         self.units_cache.clear();
 
-        for (idx, pos) in self.positions.iter().enumerate() {
+        for (idx, pos) in self.positions.iter_slots() {
             // Update units cache for all positions. Checked, not `+=`:
             // `Decimal`'s `+` panics on overflow, and this runs over payloads.
             //
@@ -4037,5 +4077,64 @@ mod tests {
         inv.add(Position::simple(Amount::new(dec!(20), "USD")))
             .expect("fits");
         assert_eq!(inv.units("USD"), dec!(20));
+    }
+
+    /// Every index `iter_slots` yields must address, through `Index`, the very
+    /// position it was yielded with.
+    ///
+    /// This is trivially true while the backing store is dense — `iter_slots`
+    /// is `iter().enumerate()` — and it is the whole reason that method
+    /// exists. The reduction paths collect indices from it and hand them back
+    /// through `Index`/`IndexMut` to mutate the lot they selected. If the
+    /// store ever becomes sparse (tombstoned lots, so a cost-keyed index can
+    /// survive removals) and `iter_slots` keeps counting from zero instead of
+    /// reporting real slots, every reduction after the first hole mutates the
+    /// WRONG LOT — silently, with correct-looking totals.
+    ///
+    /// So this pins the contract rather than the current implementation.
+    #[test]
+    fn iter_slots_yields_indices_that_address_their_own_position() {
+        let mut inv = Inventory::new();
+        for units in [dec!(10), dec!(20), dec!(30)] {
+            inv.add(Position::with_cost(
+                Amount::new(units, "AAPL"),
+                Cost::new(units * dec!(10), "USD"),
+            ))
+            .expect("fits");
+        }
+        // Two lots IDENTICAL by value. `add` never merges cost-bearing lots —
+        // it keeps them separate to match Python — so this is an ordinary
+        // inventory, and it is the shape that makes the assertion below
+        // meaningful: with only distinct lots, comparing by value cannot tell
+        // "the right slot" from "a slot holding an equal position".
+        for _ in 0..2 {
+            inv.add(Position::with_cost(
+                Amount::new(dec!(7), "AAPL"),
+                Cost::new(dec!(70), "USD"),
+            ))
+            .expect("fits");
+        }
+        inv.add(Position::simple(Amount::new(dec!(99), "USD")))
+            .expect("fits");
+
+        let mut seen = 0;
+        for (slot, position) in inv.positions.iter_slots() {
+            // Pointer identity, not `assert_eq!`. `Position: PartialEq`, so a
+            // value comparison passes when a wrong index happens to land on an
+            // equal lot — exactly what the duplicate pair above arranges.
+            // Review catch on #2065.
+            assert!(
+                std::ptr::eq(std::ptr::from_ref(&inv.positions[slot]), position),
+                "slot {slot} addresses a different position than the one it \
+                 was yielded with",
+            );
+            seen += 1;
+        }
+        assert_eq!(
+            seen,
+            inv.positions().count(),
+            "iter_slots must visit every live position",
+        );
+        assert_eq!(seen, 6, "fixture must hold six lots, two of them equal");
     }
 }
