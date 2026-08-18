@@ -109,8 +109,14 @@ pub enum Value {
     Amount(Amount),
     /// Position (amount + optional cost). Boxed to reduce enum size.
     Position(Box<Position>),
-    /// Inventory (aggregated positions). Boxed to reduce enum size.
-    Inventory(Box<Inventory>),
+    /// Inventory (aggregated positions).
+    ///
+    /// `Arc`, not `Box`: this keeps the enum small like the other boxed
+    /// variants, and additionally makes the value cheap to clone. Reading
+    /// `account_balance` used to deep-copy every lot each time the column was
+    /// evaluated, on top of the copy the posting context already held (#2086).
+    /// Nothing mutates an inventory through a `Value`, so sharing is safe.
+    Inventory(std::sync::Arc<Inventory>),
     /// Set of strings (tags, links).
     StringSet(Vec<String>),
     /// Generic set of values for IN operator (supports mixed types).
@@ -392,7 +398,7 @@ pub struct PostingContext<'a> {
     /// `account_balance` column. Updated for every posting, independent of the
     /// WHERE filter, so it always reflects the true ledger balance for the
     /// account at this point in time.
-    pub account_balance: Option<Inventory>,
+    pub account_balance: Option<std::sync::Arc<Inventory>>,
     /// The directive index (for source location lookup).
     pub directive_index: Option<usize>,
 }
