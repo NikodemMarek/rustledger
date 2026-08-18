@@ -495,7 +495,19 @@ impl BookingEngine {
                                     currency: Some(matched_cost.currency),
                                     date: matched_cost.date,
                                     label: matched_cost.label,
-                                    merge: false,
+                                    // Carry `{*}` through to application (#2068).
+                                    // Every other cost spec is a FILTER: it
+                                    // selects among lots that already exist, so
+                                    // booking can safely resolve it into the one
+                                    // lot it picked. `{*}` is an OPERATION — it
+                                    // merges the pool and only then reduces it.
+                                    // Resolving it into the per-unit cost of the
+                                    // pool it created names a lot that does not
+                                    // exist until the merge has run, so `apply`
+                                    // reported `No matching lot` for holdings the
+                                    // account plainly had. The marker has to
+                                    // survive so application re-runs the merge.
+                                    merge: cost_spec.merge,
                                 });
                                 booked_indices.insert(idx);
                             }
@@ -709,6 +721,76 @@ impl BookingEngine {
     /// overflows. Unlike [`Self::apply`] this is a SINGLE posting, so there is
     /// nothing to roll back — the caller owns transaction atomicity.
     ///
+    /// Verify a carried `{*}` against the pool booking recorded (#2068).
+    ///
+    /// `{*}` is the one cost spec that is an OPERATION rather than a filter, so
+    /// booking cannot resolve it into the lot it picked — the merged pool does
+    /// not exist until the merge runs. The marker is carried instead, which
+    /// means the booked posting re-executes the merge and is only meaningful
+    /// against the inventory it was booked against. Applied to different state
+    /// it would silently build a DIFFERENT pool.
+    ///
+    /// Booking records the per-unit cost of the pool it computed, so compare
+    /// that against the pool this inventory would produce. Read-only: nothing
+    /// has mutated when this reports, so the error needs no rollback to be
+    /// honest about the state it leaves behind.
+    ///
+    /// Skips rather than reports when there is nothing recorded to compare
+    /// against — a raw, never-booked `{*}` (`number: None`), a total or
+    /// compound cost whose per-unit value is not knowable until units are, or
+    /// cost-less lots where `{*}` degrades to AVERAGE. Errors from the merge
+    /// plan itself are also skipped: the reduction raises them with its own
+    /// message a moment later, and one function should own each message.
+    fn verify_merge_precondition(&self, posting: &Posting) -> Result<(), BookingError> {
+        let Some(spec) = posting.cost.as_ref() else {
+            return Ok(());
+        };
+        if !spec.merge {
+            return Ok(());
+        }
+        let (Some(units), Some(expected_number), Some(expected_currency)) = (
+            posting.amount(),
+            spec.number.and_then(|n| n.per_unit()),
+            spec.currency.clone(),
+        ) else {
+            return Ok(());
+        };
+        let Some(inv) = self.inventories.get(&posting.account) else {
+            return Ok(());
+        };
+        // Only a posting that will actually REDUCE runs the merge; an
+        // augmentation carrying `{*}` is added, and comparing it against a pool
+        // it never builds would reject a valid posting. Uses the canonical
+        // predicate `apply_posting` itself consults, so the two cannot drift.
+        //
+        // This also keeps `apply`'s rollback guard sound: every posting this
+        // can reject is a cost-bearing reduction, which is exactly what
+        // `has_reduction` counts, so the undo log is open whenever the check
+        // reports. Without the gate, a positive-units `{*}` posting could fail
+        // where `rollback_needed` said failure was impossible — an assert, not
+        // an error.
+        let method = self.method_for(&posting.account);
+        if !inv.is_booking_reduction(units, posting.cost.as_ref(), method) {
+            return Ok(());
+        }
+        let Ok(Some(got)) = inv.merged_pool_cost(units) else {
+            return Ok(());
+        };
+
+        let expected = rustledger_core::Amount::new(expected_number, expected_currency);
+        if got == expected {
+            return Ok(());
+        }
+        Err(convert_core_booking_error(
+            rustledger_core::BookingError::MergeMismatch {
+                currency: units.currency.clone(),
+                expected,
+                got,
+            },
+            &posting.account,
+        ))
+    }
+
     /// # Precondition
     ///
     /// Same as [`Self::apply`]: the posting must already be booked.
@@ -790,11 +872,13 @@ impl BookingEngine {
         self.overflow_is_possible(txn) || self.has_reduction(txn)
     }
 
-    /// Whether any posting reduces an existing cost-bearing lot.
+    /// Whether any posting could fail the way a reduction fails.
     ///
-    /// Uses the canonical [`Inventory::is_booking_reduction`] rather than
-    /// re-deriving "is this a reduction" from the sign, which is the drift the
-    /// duplication review kept finding.
+    /// Deliberately NOT [`Inventory::is_booking_reduction`], despite that being
+    /// the canonical "is this a reduction" predicate: this one must hold for a
+    /// transaction that has not been applied yet, and the inline comment below
+    /// records the panic that reading current state caused. The header used to
+    /// claim the opposite — it predates #2067's rewrite.
     fn has_reduction(&self, txn: &Transaction) -> bool {
         txn.postings.iter().any(|posting| {
             let Some(units) = posting.amount() else {
@@ -825,7 +909,19 @@ impl BookingEngine {
             // that does not depend on state, so it cannot be falsified by the
             // transaction itself. Strictly more conservative: every posting
             // this used to catch carries a cost spec too.
-            posting.cost.is_some() && units.number.is_sign_negative()
+            let Some(spec) = posting.cost.as_ref() else {
+                return false;
+            };
+            // `{*}` fails in BOTH directions (#2068). It is checked against the
+            // pool booking recorded, and a positive-units posting can be a
+            // reduction too — closing a short reduces cost-bearing lots while
+            // the sign test below says "augmentation". Left out, a rejected
+            // merge on that shape reaches the rollback assert with no log
+            // open, turning a reportable error into a panic. Sign-independent
+            // and state-independent, so it cannot be falsified mid-transaction
+            // either; only `{*}` postings widen the gate, which are rare enough
+            // not to reopen the #1897 snapshot regression.
+            spec.merge || units.number.is_sign_negative()
         })
     }
 
@@ -962,6 +1058,16 @@ impl BookingEngine {
                 }
             };
 
+        // Accounts this transaction has already mutated. Booking books every
+        // posting against the inventory as it stood BEFORE the transaction,
+        // while `apply` mutates sequentially — so once an earlier posting has
+        // touched an account, the pool a later `{*}` sees is legitimately not
+        // the pool booking recorded, and comparing them would reject a valid
+        // ledger (a buy and a `{*}` sale in one transaction). The recorded cost
+        // is only comparable against the state booking actually saw.
+        let mut touched: rustc_hash::FxHashSet<&rustledger_core::Account> =
+            rustc_hash::FxHashSet::default();
+
         for posting in &txn.postings {
             // EVERY posting failure aborts the transaction and rolls back —
             // overflow and failed reduction alike (#1987).
@@ -980,7 +1086,24 @@ impl BookingEngine {
             // other. Callers already handle this — `book()` records the error
             // and marks the transaction failed, the wasm entry point checks
             // `is_ok()`, and the CLI refuses to derive a figure at all.
-            if let Err(e) = self.apply_posting(posting, txn.date) {
+            // A carried `{*}` re-executes the merge (#2068), so verify the
+            // pool it will build against the one booking recorded BEFORE
+            // anything mutates. Checked here rather than in `apply_posting`
+            // for two reasons: `apply_posting` is also how the query executor
+            // replays a FILTERED transaction stream, where a different pool is
+            // the correct answer and not a defect; and a precondition that
+            // reports after mutating would depend on rollback to stay honest.
+            //
+            // Per posting rather than as a pre-pass over the transaction: an
+            // earlier posting of this same transaction can legitimately change
+            // the pool a later `{*}` sees.
+            let checked = if touched.contains(&posting.account) {
+                Ok(())
+            } else {
+                self.verify_merge_precondition(posting)
+            };
+            touched.insert(&posting.account);
+            if let Err(e) = checked.and_then(|()| self.apply_posting(posting, txn.date)) {
                 // `snapshot` is `Some` whenever this arm is reachable:
                 // `rollback_needed` covers both failure modes. Restoring
                 // nothing would be silent corruption — precisely the bug being

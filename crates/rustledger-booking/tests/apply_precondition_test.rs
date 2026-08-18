@@ -371,3 +371,295 @@ fn a_transaction_that_creates_and_then_oversells_a_lot_errors_rather_than_panick
         "the rejected transaction left its buy applied: {held:?}",
     );
 }
+
+/// A `{*}` merge books AND applies, leaving the merged pool (#2068).
+///
+/// `{*}` is the one cost spec that is an OPERATION rather than a filter: it
+/// restructures the lots before selecting from them. Booking used to resolve it
+/// into the per-unit cost of the pool it would create and clear the marker, so
+/// application went looking for a lot that only exists once the merge has run
+/// and reported `No matching lot` for a lot the account plainly held.
+#[test]
+fn a_wildcard_merge_books_and_applies_leaving_the_pool() {
+    let mut engine = BookingEngine::with_method(BookingMethod::Strict);
+    for (day, cost) in [(1u32, "100.00"), (2, "120.00")] {
+        let mut buy = Posting::new("Assets:Broker", amount("10", "AAPL"));
+        buy.cost = Some(spec(cost, "USD", day));
+        let paid = -(cost.parse::<Decimal>().unwrap() * Decimal::from(10));
+        let txn = Transaction::new(date(day), "buy")
+            .with_synthesized_posting(buy)
+            .with_synthesized_posting(Posting::new("Assets:Cash", Amount::new(paid, "USD")));
+        engine.apply(&txn).expect("buys apply");
+    }
+
+    let mut merge_sell = Posting::new("Assets:Broker", amount("-5", "AAPL"));
+    merge_sell.cost = Some(CostSpec {
+        number: None,
+        currency: None,
+        date: None,
+        label: None,
+        merge: true,
+    });
+    let txn = Transaction::new(date(10), "sell against the merged pool")
+        .with_synthesized_posting(merge_sell)
+        .with_synthesized_posting(Posting::new("Assets:Cash", amount("600.00", "USD")));
+
+    let booked = engine.book(&txn).expect("the merge books");
+    engine
+        .apply(&booked.transaction)
+        .expect("and applies — resolving the marker away is what broke this");
+
+    // 10 @ 100 + 10 @ 120 merges to 20 @ 110; selling 5 leaves 15 @ 110.
+    let lots: Vec<(Decimal, Option<Decimal>)> = engine
+        .inventories()
+        .filter(|(account, _)| account.as_str() == "Assets:Broker")
+        .flat_map(|(_, inv)| inv.positions())
+        .map(|p| (p.units.number, p.cost.as_ref().map(|c| c.number)))
+        .collect();
+    assert_eq!(
+        lots,
+        vec![(
+            "15".parse::<Decimal>().unwrap(),
+            Some("110".parse().unwrap())
+        )],
+        "the account must hold one merged pool at the weighted average",
+    );
+}
+
+/// The pool cost booking recorded is CHECKED when the merge is re-executed.
+///
+/// Carrying an operation instead of a filter has one cost: the booked posting
+/// re-runs the merge at apply time, so it is only meaningful against the
+/// inventory it was booked against. Applied to different state it would
+/// silently produce a different pool — the outcome this codebase treats as
+/// worse than any error. Booking records the pool cost it computed, so the
+/// mismatch is reported.
+#[test]
+fn a_merge_applied_against_different_inventory_is_reported() {
+    let mut engine = BookingEngine::with_method(BookingMethod::Strict);
+    for (day, cost) in [(1u32, "100.00"), (2, "120.00")] {
+        let mut buy = Posting::new("Assets:Broker", amount("10", "AAPL"));
+        buy.cost = Some(spec(cost, "USD", day));
+        engine
+            .apply(&Transaction::new(date(day), "buy").with_synthesized_posting(buy))
+            .expect("buys apply");
+    }
+
+    let mut merge_sell = Posting::new("Assets:Broker", amount("-5", "AAPL"));
+    merge_sell.cost = Some(CostSpec {
+        number: None,
+        currency: None,
+        date: None,
+        label: None,
+        merge: true,
+    });
+    let booked = engine
+        .book(&Transaction::new(date(10), "merge sell").with_synthesized_posting(merge_sell))
+        .expect("books against 100/120, recording a pool at 110");
+
+    // Move the inventory on before applying: a third lot changes the pool.
+    let mut extra = Posting::new("Assets:Broker", amount("10", "AAPL"));
+    extra.cost = Some(spec("200.00", "USD", 3));
+    engine
+        .apply(&Transaction::new(date(3), "another buy").with_synthesized_posting(extra))
+        .expect("buy applies");
+
+    let err = engine
+        .apply(&booked.transaction)
+        .expect_err("the recorded pool cost no longer matches what the merge produces");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("110") && rendered.contains("merge"),
+        "the error must name the recorded and actual pool costs, got: {rendered}",
+    );
+
+    // The check is a PRECONDITION: it runs before the merge mutates anything,
+    // so a rejected merge cannot leave a half-merged inventory behind. That is
+    // what makes it safe for `apply_posting` — which the query executor calls
+    // directly, without an undo log — to stay free of it.
+    let mut lots: Vec<(Decimal, Option<Decimal>)> = engine
+        .inventories()
+        .filter(|(account, _)| account.as_str() == "Assets:Broker")
+        .flat_map(|(_, inv)| inv.positions())
+        .map(|p| (p.units.number, p.cost.as_ref().map(|c| c.number)))
+        .collect();
+    lots.sort_by_key(|(_, cost)| *cost);
+    assert_eq!(
+        lots,
+        vec![
+            (
+                "10".parse::<Decimal>().unwrap(),
+                Some("100".parse().unwrap())
+            ),
+            (
+                "10".parse::<Decimal>().unwrap(),
+                Some("120".parse().unwrap())
+            ),
+            (
+                "10".parse::<Decimal>().unwrap(),
+                Some("200".parse().unwrap())
+            ),
+        ],
+        "the failed merge must leave all three lots unmerged and undrained",
+    );
+}
+
+/// A `{*}` posting that AUGMENTS is not checked against a pool it never builds.
+///
+/// The merge precondition (#2068) compares the pool booking recorded against
+/// the pool this inventory would produce — but only a reduction ever runs the
+/// merge. A positive-units posting carrying an explicit `{110.00 USD, *}` is
+/// ADDED, and an account holding short lots at a different cost would make the
+/// comparison disagree about a merge that is not going to happen.
+///
+/// Worse than a spurious error: `rollback_needed` counts cost-bearing NEGATIVE
+/// postings, so no undo log is open for an augmentation, and failing here trips
+/// `apply`'s soundness assert rather than returning. The check is gated on the
+/// same `is_booking_reduction` that decides whether `apply_posting` reduces at
+/// all, so the two cannot disagree.
+#[test]
+fn a_wildcard_augmentation_is_added_not_checked() {
+    let mut engine = BookingEngine::with_method(BookingMethod::None);
+
+    let mut short = Posting::new("Assets:Short", amount("-10", "X"));
+    short.cost = Some(spec("100.00", "USD", 1));
+    engine
+        .apply(&Transaction::new(date(1), "open a short lot").with_synthesized_posting(short))
+        .expect("the short lot applies");
+
+    // Positive units, explicit cost, merge marker: an augmentation whose stated
+    // cost differs from the pool the short lot would merge into.
+    let mut augment = Posting::new("Assets:Short", amount("10", "X"));
+    augment.cost = Some(CostSpec {
+        number: Some(rustledger_core::CostNumber::PerUnit {
+            value: "110".parse().expect("literal parses"),
+        }),
+        currency: Some("USD".into()),
+        date: None,
+        label: None,
+        merge: true,
+    });
+    engine
+        .apply(&Transaction::new(date(2), "augment").with_synthesized_posting(augment))
+        .expect("an augmentation is added, not compared against a pool");
+
+    let mut lots: Vec<(Decimal, Option<Decimal>)> = engine
+        .inventories()
+        .filter(|(account, _)| account.as_str() == "Assets:Short")
+        .flat_map(|(_, inv)| inv.positions())
+        .map(|p| (p.units.number, p.cost.as_ref().map(|c| c.number)))
+        .collect();
+    lots.sort_by_key(|(units, _)| *units);
+    assert_eq!(
+        lots,
+        vec![
+            (
+                "-10".parse::<Decimal>().unwrap(),
+                Some("100".parse().unwrap())
+            ),
+            (
+                "10".parse::<Decimal>().unwrap(),
+                Some("110".parse().unwrap())
+            ),
+        ],
+        "both lots stand: the augmentation was added at its own cost",
+    );
+}
+
+/// Rejecting a `{*}` that CLOSES A SHORT errors rather than panicking.
+///
+/// A reduction is not the same thing as a negative posting: closing a short
+/// reduces cost-bearing lots with POSITIVE units. `rollback_needed` counts
+/// postings by sign (deliberately — reading current state to answer it caused
+/// the #2067 panic), so a positive-units `{*}` that the merge precondition
+/// rejects would reach `apply`'s "the guard is unsound" assert with no undo
+/// log open, turning a reportable error into a panic out of the engine.
+///
+/// `has_reduction` therefore counts `{*}` postings in BOTH directions.
+#[test]
+fn a_rejected_merge_closing_a_short_errors_rather_than_panicking() {
+    let mut engine = BookingEngine::with_method(BookingMethod::Strict);
+
+    let mut short = Posting::new("Assets:Short", amount("-10", "X"));
+    short.cost = Some(spec("100.00", "USD", 1));
+    engine
+        .apply(&Transaction::new(date(1), "open a short").with_synthesized_posting(short))
+        .expect("the short lot applies");
+
+    // Positive units REDUCING the short, carrying a pool cost that no longer
+    // matches — the shape that used to panic.
+    let mut close = Posting::new("Assets:Short", amount("10", "X"));
+    close.cost = Some(CostSpec {
+        number: Some(rustledger_core::CostNumber::PerUnit {
+            value: "110".parse().expect("literal parses"),
+        }),
+        currency: Some("USD".into()),
+        date: None,
+        label: None,
+        merge: true,
+    });
+    let err = engine
+        .apply(&Transaction::new(date(2), "close the short").with_synthesized_posting(close))
+        .expect_err("the recorded pool cost does not match this inventory");
+    assert!(
+        format!("{err}").contains("merge"),
+        "must report the mismatch, not panic: {err}",
+    );
+
+    // And the short is intact: the precondition rejected it before mutating.
+    let lots: Vec<(Decimal, Option<Decimal>)> = engine
+        .inventories()
+        .filter(|(account, _)| account.as_str() == "Assets:Short")
+        .flat_map(|(_, inv)| inv.positions())
+        .map(|p| (p.units.number, p.cost.as_ref().map(|c| c.number)))
+        .collect();
+    assert_eq!(
+        lots,
+        vec![(
+            "-10".parse::<Decimal>().unwrap(),
+            Some("100".parse().unwrap())
+        )],
+        "the rejected merge must leave the short untouched",
+    );
+}
+
+/// A buy and a `{*}` sale in ONE transaction is not a mismatch.
+///
+/// Booking books every posting against the inventory as it stood BEFORE the
+/// transaction, while `apply` mutates sequentially. So the buy earlier in this
+/// same transaction legitimately moves the pool the `{*}` sale meets, and the
+/// cost booking recorded is not comparable against it — the check must only
+/// compare against the state booking actually saw.
+///
+/// (The two views of this transaction do disagree about the reduction's cost,
+/// which is the separate book-vs-apply ordering question; this test pins only
+/// that the precondition does not blame the ledger for it.)
+#[test]
+fn a_buy_and_a_merge_sale_in_one_transaction_is_not_a_mismatch() {
+    let mut engine = BookingEngine::with_method(BookingMethod::Strict);
+
+    let mut first = Posting::new("Assets:Stock", amount("10", "X"));
+    first.cost = Some(spec("100.00", "USD", 1));
+    engine
+        .apply(&Transaction::new(date(1), "buy lot 1").with_synthesized_posting(first))
+        .expect("the first buy applies");
+
+    let mut buy = Posting::new("Assets:Stock", amount("10", "X"));
+    buy.cost = Some(spec("120.00", "USD", 2));
+    let mut sell = Posting::new("Assets:Stock", amount("-5", "X"));
+    sell.cost = Some(CostSpec {
+        number: None,
+        currency: None,
+        date: None,
+        label: None,
+        merge: true,
+    });
+    let txn = Transaction::new(date(2), "buy and merge-sell together")
+        .with_synthesized_posting(buy)
+        .with_synthesized_posting(sell);
+
+    let booked = engine.book(&txn).expect("the transaction books");
+    engine
+        .apply(&booked.transaction)
+        .expect("the buy moved the pool; that is the engine's own ordering, not a bad ledger");
+}

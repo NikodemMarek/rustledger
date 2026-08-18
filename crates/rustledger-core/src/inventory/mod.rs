@@ -161,6 +161,31 @@ pub enum BookingError {
         /// Got currency.
         got: crate::Currency,
     },
+    /// A `{*}` merge produced a different pool than booking recorded (#2068).
+    ///
+    /// `{*}` is an OPERATION, not a filter: unlike every other cost spec it
+    /// restructures the lots before selecting from them. Booking therefore
+    /// carries the marker into application rather than resolving it into a
+    /// per-unit cost, because the lot it would name does not exist until the
+    /// merge runs.
+    ///
+    /// The consequence is that a booked posting carrying `{*}` re-executes the
+    /// merge when applied, so it is only meaningful against the state it was
+    /// booked against. Booking also records the pool cost it computed, and
+    /// application checks it here — turning "applied against different state,
+    /// silently different answer" into a reported error.
+    MergeMismatch {
+        /// The commodity being reduced (e.g. `AAPL`).
+        currency: crate::Currency,
+        /// The per-unit pool cost booking recorded, in the cost currency.
+        expected: crate::Amount,
+        /// The per-unit pool cost the merge would produce, in the cost currency.
+        ///
+        /// Carried as an [`Amount`] rather than a bare number
+        /// so the message reads `110.00 USD`: the pool cost is denominated in
+        /// the COST currency, which is not the commodity in `currency`.
+        got: crate::Amount,
+    },
     /// The arithmetic left `rust_decimal`'s ~±7.9e28 range (#1863).
     ///
     /// Reported rather than clamped: `Decimal::MIN == -Decimal::MAX`, so
@@ -211,6 +236,16 @@ impl From<OverflowError> for BookingError {
 impl fmt::Display for BookingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MergeMismatch {
+                currency,
+                expected,
+                got,
+            } => write!(
+                f,
+                "{{*}} merge of {currency} would produce a pool cost of {got}, \
+                 but booking recorded {expected}: this posting is being applied \
+                 against different inventory than it was booked against"
+            ),
             Self::AmbiguousMatch {
                 num_matches,
                 currency,
@@ -287,6 +322,7 @@ impl fmt::Display for AccountedBookingError {
             // The currency is already named in the inner message; the account
             // is the context this wrapper exists to add.
             BookingError::Overflow(e) => write!(f, "{}: {e}", self.account),
+            BookingError::MergeMismatch { .. } => write!(f, "{}: {}", self.account, self.error),
             BookingError::InsufficientUnits {
                 requested,
                 available,
