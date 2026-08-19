@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { initSync } from '@rustledger/wasm';
 import * as rustledger from '@rustledger/wasm';
 import { handleToolCall } from '../handlers.js';
-import { validateArgs, formatErrors, formatQueryResult, textResponse, errorResponse, jsonResponse, loadWithIncludes, withIncludedContext } from '../helpers.js';
+import { validateArgs, formatErrors, formatValidation, fatalErrors, formatQueryResult, textResponse, errorResponse, jsonResponse, collectLedgerFiles, withIncludedContext } from '../helpers.js';
 import { TOOLS } from '../tools.js';
 import { RESOURCES, getResourceContents } from '../resources.js';
 import { PROMPTS, getPrompt } from '../prompts.js';
@@ -59,6 +59,70 @@ describe('rustledger WASM bindings', () => {
       const result = rustledger.validateSource(invalidLedger);
       expect(result.valid).toBe(false);
       expect(result.errors.length).toBeGreaterThan(0);
+    });
+
+    // The three shapes from #2084. The reporter's ledger validated clean here
+    // while `rledger check` found real errors, and the coverage above could
+    // not have caught it: an unopened account is refused during the early
+    // phase, whereas a failed assertion and an out-of-balance transaction are
+    // only decided once the ledger has been booked. Those are the checks a
+    // user reaches for this tool to run.
+
+    it('reports a failed balance assertion', () => {
+      const result = rustledger.validateSource(`
+2020-01-01 open Assets:Cash USD
+2020-01-01 open Equity:O USD
+
+2020-06-01 * "deposit"
+  Assets:Cash   100.00 USD
+  Equity:O     -100.00 USD
+
+2020-07-01 balance Assets:Cash  -999999.00 USD
+`);
+      expect(result.valid).toBe(false);
+      expect(result.errors.map((e: { code: string }) => e.code)).toContain('E2001');
+    });
+
+    it('reports a transaction that does not balance', () => {
+      const result = rustledger.validateSource(`
+2020-01-01 open Assets:Bank KRW
+2020-01-01 open Liabilities:Card KRW
+2020-01-01 open Equity:Opening-Balances KRW
+
+2020-01-02 * "opening balances"
+  Assets:Bank              1000000 KRW
+  Liabilities:Card         -179720 KRW
+  Equity:Opening-Balances  -500000 KRW
+`);
+      expect(result.valid).toBe(false);
+      expect(result.errors.map((e: { code: string }) => e.code)).toContain('E3001');
+    });
+
+    it('still validates a ledger that also emits a warning', () => {
+      // This is the regression itself. Before #1464, `run_validation` bailed
+      // on `!load.errors.is_empty()`, so a single plugin WARNING skipped every
+      // check that follows — and a large ledger almost always emits one. The
+      // assertion below is wrong by a million, and the tool reported success.
+      const result = rustledger.validateSource(`
+plugin "unrealized" "Equity:Unrealized"
+2020-01-01 open Assets:Stock
+2020-01-01 open Assets:Cash
+2020-01-01 open Equity:Unrealized
+
+2020-01-02 * "buy"
+  Assets:Stock  10 AAPL {100.00 USD}
+  Assets:Cash  -1000.00 USD
+
+2020-06-01 price AAPL 150.00 USD
+
+2020-07-01 balance Assets:Cash  -999999.00 USD
+`);
+      const warnings = result.errors.filter(
+        (e: { severity: string }) => e.severity === 'warning'
+      );
+      expect(warnings.length).toBeGreaterThan(0);
+      expect(result.valid).toBe(false);
+      expect(result.errors.map((e: { code: string }) => e.code)).toContain('E2001');
     });
   });
 
@@ -221,8 +285,70 @@ describe('Helper Functions', () => {
       ];
       const result = formatErrors(errors);
       expect(result).toContain('[error]');
-      expect(result).toContain(':10:5');
+      expect(result).toContain('10:5');
       expect(result).toContain('Test error');
+    });
+
+    it('treats only errors as blocking, not warnings', () => {
+      // The wasm entry points carry non-fatal notices in the same `errors`
+      // array as real failures, so a bare `errors.length > 0` check made a
+      // plugin warning fatal. That is how `query` on a ledger using the
+      // `unrealized` plugin returned the warning and threw away the rows,
+      // where `rledger query` prints them.
+      const mixed = [
+        { message: 'Unrealized gain', severity: 'warning' as const },
+        { message: 'parse error', severity: 'error' as const },
+      ];
+      expect(fatalErrors(mixed).map((e) => e.message)).toEqual(['parse error']);
+      expect(fatalErrors([{ message: 'Unrealized gain', severity: 'warning' as const }])).toEqual([]);
+      expect(fatalErrors(undefined)).toEqual([]);
+    });
+
+    it('lists warnings on a ledger that is still valid', () => {
+      // A warning is not an error — the ledger is valid and `rledger check`
+      // exits 0 — but it still has to be SHOWN. Reporting only when `valid` is
+      // false meant a ledger the CLI describes as `⚠ 1 warning` came back as a
+      // bare "Ledger is valid.", from a tool whose description promises
+      // "validation errors and warnings".
+      const out = formatValidation({
+        valid: true,
+        errors: [{ message: 'Unrealized gain on 10 AAPL', severity: 'warning' as const }],
+      });
+      expect(out).toContain('valid');
+      expect(out).toContain('1 warning');
+      expect(out).toContain('Unrealized gain on 10 AAPL');
+    });
+
+    it('says nothing extra when there is nothing to say', () => {
+      expect(formatValidation({ valid: true, errors: [] })).toBe('Ledger is valid.');
+    });
+
+    it('counts errors, not warnings, when reporting a failure', () => {
+      const out = formatValidation({
+        valid: false,
+        errors: [
+          { message: 'Balance failed', severity: 'error' as const },
+          { message: 'Unrealized gain', severity: 'warning' as const },
+        ],
+      });
+      expect(out).toContain('Found 1 error(s)');
+      // The warning is still listed — it just does not inflate the count.
+      expect(out).toContain('Unrealized gain');
+    });
+
+    it('names the file when the error carries one', () => {
+      // The multi-file entry points attribute each error to the file it is in.
+      // On a ledger split across monthly journals a bare `:561` does not say
+      // 561 of WHICH file, which is most of what the location is for.
+      const errors = [
+        {
+          message: 'Balance failed',
+          file: 'journals/2021-11.beancount',
+          line: 561,
+          severity: 'error' as const,
+        },
+      ];
+      expect(formatErrors(errors)).toContain('journals/2021-11.beancount:561');
     });
 
     it('should handle errors without location', () => {
@@ -803,122 +929,252 @@ describe('Prompts', () => {
 // ============================================================================
 // Include Resolution Tests
 // ============================================================================
-
-describe('loadWithIncludes', () => {
+describe('collectLedgerFiles', () => {
+  // Discovery only. Include SEMANTICS — resolution order, glob expansion, a
+  // file reached twice, cycles, and which file and line an error belongs to —
+  // are asserted against the loader through `validateMultiFile`, because that
+  // is where they now live. This function's job is to put candidate files in
+  // the map; over-collecting is harmless and under-collecting is reported by
+  // the loader against the file that asked.
   let tempDir: string;
 
   beforeAll(() => {
-    // Create a temporary directory for test files
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-test-'));
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-collect-'));
   });
 
-  afterAll(() => {
-    // Clean up temp files
-    fs.rmSync(tempDir, { recursive: true, force: true });
+  const write = (rel: string, content: string): string => {
+    const abs = path.join(tempDir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+    return abs;
+  };
+
+  it('collects a single file with no includes', () => {
+    const main = write('solo/main.beancount', '2024-01-01 open Assets:Cash USD\n');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(entry).toBe('main.beancount');
+    expect(Object.keys(files)).toEqual(['main.beancount']);
   });
 
-  it('should load a single file without includes', () => {
-    const filePath = path.join(tempDir, 'single.beancount');
-    fs.writeFileSync(filePath, '2024-01-01 open Assets:Bank USD');
-
-    const result = loadWithIncludes(filePath);
-    expect(result).toBe('2024-01-01 open Assets:Bank USD');
+  it('collects an include, keyed relative to the entry point', () => {
+    write('one/accounts.beancount', '2024-01-01 open Assets:Cash USD\n');
+    const main = write('one/main.beancount', 'include "accounts.beancount"\n');
+    const { files } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual(['accounts.beancount', 'main.beancount']);
   });
 
-  it('should resolve a single include', () => {
-    const mainPath = path.join(tempDir, 'main.beancount');
-    const includedPath = path.join(tempDir, 'accounts.beancount');
-
-    fs.writeFileSync(includedPath, '2024-01-01 open Assets:Cash USD');
-    fs.writeFileSync(mainPath, `include "accounts.beancount"
-
-2024-01-15 * "Test"
-  Expenses:Food  10 USD
-  Assets:Cash  -10 USD
-`);
-
-    const result = loadWithIncludes(mainPath);
-    expect(result).toContain('2024-01-01 open Assets:Cash USD');
-    expect(result).toContain('2024-01-15 * "Test"');
+  it('collects nested includes and uses forward slashes in keys', () => {
+    write('nest/sub/deep.beancount', '2024-01-01 open Assets:Deep USD\n');
+    write('nest/sub/level1.beancount', 'include "deep.beancount"\n');
+    const main = write('nest/main.beancount', 'include "sub/level1.beancount"\n');
+    const { files } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual([
+      'main.beancount',
+      'sub/deep.beancount',
+      'sub/level1.beancount',
+    ]);
   });
 
-  it('should resolve nested includes', () => {
-    const mainPath = path.join(tempDir, 'nested-main.beancount');
-    const level1Path = path.join(tempDir, 'level1.beancount');
-    const level2Path = path.join(tempDir, 'level2.beancount');
+  it('collects a file reached twice exactly once, and the loader decides the rest', () => {
+    // A diamond. The map is unique by construction, so the doubling that a
+    // concatenating loader had to guard against cannot arise here at all.
+    write('dia/sub/shared.beancount',
+      '2020-03-01 * "shared txn"\n  Expenses:Food   100.00 USD\n  Assets:Cash    -100.00 USD\n');
+    write('dia/sub/mid.beancount', 'include "shared.beancount"\n');
+    const main = write('dia/main.beancount',
+      '2020-01-01 open Assets:Cash USD\n2020-01-01 open Expenses:Food USD\n' +
+      'include "sub/shared.beancount"\ninclude "sub/mid.beancount"\n' +
+      '2020-06-01 balance Assets:Cash -100.00 USD\n');
 
-    fs.writeFileSync(level2Path, '2024-01-01 open Assets:Nested USD');
-    fs.writeFileSync(level1Path, `include "level2.beancount"
-2024-01-01 open Expenses:Food USD
-`);
-    fs.writeFileSync(mainPath, `include "level1.beancount"
-2024-01-15 * "Transaction"
-  Expenses:Food  5 USD
-  Assets:Nested  -5 USD
-`);
-
-    const result = loadWithIncludes(mainPath);
-    expect(result).toContain('Assets:Nested');
-    expect(result).toContain('Expenses:Food');
-    expect(result).toContain('Transaction');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual([
+      'main.beancount', 'sub/mid.beancount', 'sub/shared.beancount',
+    ]);
+    // 100.00, not 200.00: the shared file contributes once.
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.valid).toBe(true);
   });
 
-  it('should resolve includes with relative paths', () => {
-    const subDir = path.join(tempDir, 'subdir');
-    fs.mkdirSync(subDir, { recursive: true });
+  it('collects every file a glob matches', () => {
+    // `include "j/*.beancount"` is how a ledger split into monthly files is
+    // written. The loader expands the pattern itself over the virtual
+    // filesystem; discovery just has to have put the files there.
+    for (const m of ['01', '02', '03']) {
+      write(`glob/j/2020-${m}.beancount`,
+        `2020-${m}-05 * "t${m}"\n  Expenses:Food   1${m}.00 USD\n  Assets:Cash    -1${m}.00 USD\n`);
+    }
+    const main = write('glob/main.beancount',
+      '2020-01-01 open Assets:Cash USD\n2020-01-01 open Expenses:Food USD\ninclude "j/*.beancount"\n');
 
-    const mainPath = path.join(tempDir, 'rel-main.beancount');
-    const includedPath = path.join(subDir, 'sub-file.beancount');
-
-    fs.writeFileSync(includedPath, '2024-01-01 open Assets:SubDir USD');
-    fs.writeFileSync(mainPath, 'include "subdir/sub-file.beancount"');
-
-    const result = loadWithIncludes(mainPath);
-    expect(result).toContain('Assets:SubDir');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual([
+      'j/2020-01.beancount', 'j/2020-02.beancount', 'j/2020-03.beancount', 'main.beancount',
+    ]);
+    const q = rustledger.queryMultiFile(
+      files, entry, "SELECT sum(number(position)) AS n WHERE account='Expenses:Food'");
+    expect(q.rows[0][0]).toContain('306');
   });
 
-  it('should detect circular includes', () => {
-    const file1Path = path.join(tempDir, 'circular1.beancount');
-    const file2Path = path.join(tempDir, 'circular2.beancount');
+  it('does not collect a directory a glob happens to match', () => {
+    // beancount 3.2.3 dies with an unhandled IsADirectoryError here and
+    // `rledger check` reports `Is a directory`. Only files can be included.
+    fs.mkdirSync(path.join(tempDir, 'gdir/d/subdir'), { recursive: true });
+    write('gdir/d/x.beancount',
+      '2020-03-01 * "t"\n  Expenses:Food   10.00 USD\n  Assets:Cash    -10.00 USD\n');
+    const main = write('gdir/main.beancount',
+      '2020-01-01 open Assets:Cash USD\n2020-01-01 open Expenses:Food USD\ninclude "d/*"\n');
 
-    fs.writeFileSync(file1Path, 'include "circular2.beancount"');
-    fs.writeFileSync(file2Path, 'include "circular1.beancount"');
-
-    // Verify error message contains the file path for debugging
-    expect(() => loadWithIncludes(file1Path)).toThrow(/Circular include.*circular1\.beancount/);
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual(['d/x.beancount', 'main.beancount']);
+    expect(rustledger.validateMultiFile(files, entry).valid).toBe(true);
   });
 
-  it('should allow diamond includes (same file from different branches)', () => {
-    // Test case: A includes B and C, both B and C include D
-    // This should NOT be detected as circular - D is included twice but not in a cycle
-    const mainPath = path.join(tempDir, 'diamond-main.beancount');
-    const branchBPath = path.join(tempDir, 'diamond-b.beancount');
-    const branchCPath = path.join(tempDir, 'diamond-c.beancount');
-    const sharedPath = path.join(tempDir, 'diamond-shared.beancount');
+  it('terminates on a cycle and lets the loader report it', () => {
+    // Discovery must not recurse forever; the VERDICT is the loader's, and its
+    // wording matches `rledger check` because it is the same code.
+    write('cyc/b.beancount', 'include "a.beancount"\n');
+    const main = write('cyc/a.beancount', 'include "b.beancount"\n');
 
-    fs.writeFileSync(sharedPath, '2024-01-01 open Assets:Shared USD');
-    fs.writeFileSync(branchBPath, 'include "diamond-shared.beancount"\n2024-01-01 open Assets:B USD');
-    fs.writeFileSync(branchCPath, 'include "diamond-shared.beancount"\n2024-01-01 open Assets:C USD');
-    fs.writeFileSync(mainPath, 'include "diamond-b.beancount"\ninclude "diamond-c.beancount"');
-
-    // Should succeed - the shared file is included twice but not circularly
-    const result = loadWithIncludes(mainPath);
-    expect(result).toContain('Assets:Shared');
-    expect(result).toContain('Assets:B');
-    expect(result).toContain('Assets:C');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files).sort()).toEqual(['a.beancount', 'b.beancount']);
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0].message).toContain('Duplicate filename parsed');
+    expect(result.errors[0].message).toContain('include cycle');
   });
 
-  it('should throw error for missing included file', () => {
-    const mainPath = path.join(tempDir, 'missing-include.beancount');
-    fs.writeFileSync(mainPath, 'include "nonexistent.beancount"');
+  it('terminates when a glob matches its own file', () => {
+    const main = write('gself/self.beancount', 'include "*.beancount"\n');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files)).toEqual(['self.beancount']);
+    expect(rustledger.validateMultiFile(files, entry).errors[0].message).toContain(
+      'Duplicate filename parsed'
+    );
+  });
 
-    expect(() => loadWithIncludes(mainPath)).toThrow('Failed to include');
+  it('leaves a glob that matches nothing to the loader', () => {
+    const main = write('gnone/main.beancount', 'include "nothing/*.beancount"\n');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files)).toEqual(['main.beancount']);
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.errors[0].message).toContain('does not match any files');
+  });
+
+  it('leaves a missing include to the loader', () => {
+    // Discovery cannot read it, so it stays out of the map and the loader
+    // reports it against the file that asked — better placed than anything
+    // this function could say.
+    const main = write('gone/main.beancount', 'include "gone.beancount"\n');
+    const { files, entry } = collectLedgerFiles(main);
+    expect(Object.keys(files)).toEqual(['main.beancount']);
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.errors[0].message).toContain('gone.beancount');
+  });
+
+  // `it.fails` — pinned to the bundled wasm version, NOT a disabled test.
+  // The loader reports `Duplicate filename parsed` for a file reached twice
+  // (see the sibling change in `rustledger-loader`), but the `@rustledger/wasm`
+  // build pinned in package.json predates it, so `validateMultiFile` still
+  // answers `valid: true` here. The assertion is correct; the bundled binding
+  // is stale.
+  //
+  // `it.fails` inverts the verdict: the suite is GREEN while this fails and
+  // turns RED once the wasm is rebuilt — at which point delete the `.fails`.
+  // That is the point: the marker cannot outlive the staleness, and whoever
+  // bumps the dependency is told rather than finding a skip years later.
+  it.fails('reports a file reached twice, once the wasm carries the loader fix', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-dupwasm-'));
+    fs.mkdirSync(path.join(dir, 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sub/shared.beancount'), '2020-01-01 open Assets:Cash USD\n');
+    fs.writeFileSync(path.join(dir, 'sub/mid.beancount'), 'include "shared.beancount"\n');
+    const main = path.join(dir, 'dup.beancount');
+    fs.writeFileSync(main, 'include "sub/shared.beancount"\ninclude "sub/mid.beancount"\n');
+
+    const { files, entry } = collectLedgerFiles(main);
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.errors.some((e: { message: string }) =>
+      e.message.includes('Duplicate filename parsed'))).toBe(true);
+  });
+
+  it('resolves includes relative to a symlinked entry point\'s real directory', () => {
+    // A relative include resolves against the directory the file really lives
+    // in. Reading through a symlinked entry and then resolving its includes
+    // beside the LINK looked for files that are not there, so the whole ledger
+    // failed with `file not found` on a tree `rledger check` reads fine.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-linkentry-'));
+    fs.mkdirSync(path.join(dir, 'real'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'real/x.beancount'),
+      '2020-03-01 * "t"\n  Expenses:Food   10.00 USD\n  Assets:Cash    -10.00 USD\n'
+    );
+    fs.writeFileSync(
+      path.join(dir, 'real/main.beancount'),
+      '2020-01-01 open Assets:Cash USD\n2020-01-01 open Expenses:Food USD\ninclude "x.beancount"\n'
+    );
+    const link = path.join(dir, 'entry.beancount');
+    fs.symlinkSync(path.join(dir, 'real/main.beancount'), link);
+
+    const { files, entry } = collectLedgerFiles(link);
+    expect(Object.keys(files).sort()).toEqual(['main.beancount', 'x.beancount']);
+    expect(entry).toBe('main.beancount');
+    const result = rustledger.queryMultiFile(
+      files,
+      entry,
+      "SELECT sum(number(position)) AS n WHERE account='Expenses:Food'"
+    );
+    expect(result.rows[0][0]).toContain('10.00');
+  });
+
+  it('does not count a symlinked file twice', () => {
+    // `path.resolve` normalizes `.` and `..` but not symlinks, so a file
+    // reached both directly and through a link used to land under two keys —
+    // and a VirtualFileSystem has no symlinks to collapse them again, so the
+    // loader read the same directives twice and silently doubled every amount
+    // in that file: 20.00 where `rledger check` says 10.00.
+    //
+    // The alias still has to resolve, since an include names it, so it stands
+    // in a one-line include of the canonical copy.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-symlink-'));
+    fs.mkdirSync(path.join(dir, 'j'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'j/x.beancount'),
+      '2020-03-01 * "t"\n  Expenses:Food   10.00 USD\n  Assets:Cash    -10.00 USD\n'
+    );
+    fs.symlinkSync(path.join(dir, 'j/x.beancount'), path.join(dir, 'link.beancount'));
+    const main = path.join(dir, 'sym.beancount');
+    fs.writeFileSync(
+      main,
+      '2020-01-01 open Assets:Cash USD\n2020-01-01 open Expenses:Food USD\n' +
+        'include "j/x.beancount"\ninclude "link.beancount"\n'
+    );
+
+    const { files, entry } = collectLedgerFiles(main);
+    const result = rustledger.queryMultiFile(
+      files,
+      entry,
+      "SELECT sum(number(position)) AS n WHERE account='Expenses:Food'"
+    );
+    expect(result.rows[0][0]).toContain('10.00');
+  });
+
+  it('attributes an error to the file and line it is on', () => {
+    // The reason this architecture exists. Concatenating the ledger into one
+    // string reported this same error as `file: null, line: 9` — a position in
+    // the concatenation that appears in none of the user's files.
+    write('attr/j/2020-06.beancount',
+      '2020-06-01 * "deposit"\n  Assets:Cash   100.00 USD\n  Equity:O     -100.00 USD\n');
+    write('attr/j/2020-07.beancount', '\n2020-07-01 balance Assets:Cash  -999999.00 USD\n');
+    const main = write('attr/main.beancount',
+      'option "operating_currency" "USD"\n2020-01-01 open Assets:Cash USD\n' +
+      '2020-01-01 open Equity:O USD\ninclude "j/2020-06.beancount"\ninclude "j/2020-07.beancount"\n');
+
+    const { files, entry } = collectLedgerFiles(main);
+    const result = rustledger.validateMultiFile(files, entry);
+    expect(result.valid).toBe(false);
+    expect(result.errors[0].file).toBe('j/2020-07.beancount');
+    expect(result.errors[0].line).toBe(2);
   });
 });
-
-// ============================================================================
-// File Handler Tests with Includes
-// ============================================================================
 
 describe('File Handlers with Include Resolution', () => {
   let tempDir: string;

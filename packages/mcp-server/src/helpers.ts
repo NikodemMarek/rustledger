@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import type {
   BeancountError,
+  ValidationOutcome,
   QueryResult,
   ToolResponse,
   ToolArguments,
@@ -18,51 +19,177 @@ import type {
 const INCLUDE_PATTERN = '^\\uFEFF?include\\s+"([^"]+)"[ \\t]*(?:;[^\\r\\n]*)?[ \\t\\r]*$';
 const INCLUDE_REGEX = new RegExp(INCLUDE_PATTERN, 'gm');
 
+/** Glob metacharacters beancount honors in an `include`. */
+const GLOB_CHARS = /[*?[\]]/;
+
 /**
- * Load a beancount file with all its includes resolved.
+ * Resolve one `include` target to the absolute paths it names.
  *
- * This recursively follows include directives and returns the concatenated
- * source with all includes inlined. Paths in include directives are resolved
- * relative to the file containing the include.
+ * `include "journals/*.beancount"` is how a ledger split into monthly files is
+ * normally written, and both `rledger check` and bean-check expand it. Both
+ * traversers here used to hand the pattern to `path.resolve` as a literal
+ * filename and fail with `ENOENT ... 'journals/*.beancount'` on a ledger the
+ * CLI loads without complaint — so this lives in one place and both use it.
  *
- * @param filePath - The absolute path to the main beancount file
- * @returns The concatenated source with all includes resolved
- * @throws Error if a file cannot be read or circular include detected
+ * Matches are sorted so the assembled source is stable run to run
+ * (`fs.globSync` gives no ordering guarantee), directories are dropped since
+ * only files can be included, and a pattern matching nothing is an error with
+ * the wording both reference tools use.
  */
-export function loadWithIncludes(filePath: string): string {
-  const visited = new Set<string>();
-  return loadFileRecursive(filePath, visited);
-}
-
-function loadFileRecursive(filePath: string, visited: Set<string>): string {
-  const absolutePath = path.resolve(filePath);
-
-  // Check for circular includes (only in current recursion stack)
-  if (visited.has(absolutePath)) {
-    throw new Error(`Circular include detected: ${absolutePath}`);
+function resolveIncludeTargets(includePath: string, baseDir: string): string[] {
+  if (!GLOB_CHARS.test(includePath)) {
+    return [path.resolve(baseDir, includePath)];
   }
-  visited.add(absolutePath);
 
-  try {
-    const source = fs.readFileSync(absolutePath, "utf-8");
-    const baseDir = path.dirname(absolutePath);
-
-    // Replace each include directive with the contents of the included file
-    return source.replace(INCLUDE_REGEX, (_match, includePath: string) => {
-      const includeAbsPath = path.resolve(baseDir, includePath);
+  const matches = fs
+    .globSync(includePath, { cwd: baseDir })
+    .map((m) => path.resolve(baseDir, m))
+    .filter((m) => {
       try {
-        return loadFileRecursive(includeAbsPath, visited);
-      } catch (error) {
-        // Re-throw with context about which include failed
-        const msg = error instanceof Error ? error.message : String(error);
-        throw new Error(`Failed to include "${includePath}" from ${absolutePath}: ${msg}`);
+        return fs.statSync(m).isFile();
+      } catch {
+        return false;
       }
-    });
-  } finally {
-    // Remove from visited after processing to allow same file from different branches
-    visited.delete(absolutePath);
+    })
+    .sort();
+  if (matches.length === 0) {
+    throw new Error(`include pattern "${includePath}" does not match any files`);
   }
+  return matches;
 }
+/**
+ * Gather a ledger's files into the `{ path: contents }` map the wasm
+ * multi-file entry points take, keyed relative to the entry point's directory.
+ *
+ * This is DISCOVERY ONLY. Include *semantics* — resolution order, glob
+ * expansion, de-duplicating a file reached twice, cycle detection, and above
+ * all which file and line an error belongs to — are the loader's, reached
+ * through `validateMultiFile` / `queryMultiFile`, which run the same
+ * `Loader` as `rledger check` over a `VirtualFileSystem` built from this map.
+ *
+ * That division is the point. The alternative this replaces concatenated every
+ * included file into one string and validated that, which meant reimplementing
+ * the loader's include handling in TypeScript — and getting it wrong four
+ * separate ways (doubled diamonds, unreported duplicates, no glob support, and
+ * the same gaps again in the sibling traverser). It also destroyed error
+ * locations: an error on line 2 of `j/2020-07.beancount` was reported as
+ * `file: null, line: 9`, a position in the concatenation that exists in none
+ * of the user's files.
+ *
+ * Being approximate here is safe in a way that being approximate about
+ * semantics is not. Over-collecting is harmless — the loader simply never
+ * visits a file nothing includes. Under-collecting is reported properly, as a
+ * missing include, against the file that asked for it.
+ */
+export function collectLedgerFiles(entryPath: string): {
+  files: Record<string, string>;
+  entry: string;
+} {
+  // Canonicalize the ENTRY before anything derives from it. Its directory
+  // becomes the root every key is relative to, and a relative include inside a
+  // file resolves against the directory that file really lives in — which for
+  // a symlinked entry point is the target's directory, not the link's. Reading
+  // through the link and then resolving `include "x.beancount"` beside the
+  // LINK looked for a file that is not there, so the whole ledger failed with
+  // `file not found` on a tree `rledger check` reads without trouble.
+  const linkedEntry = path.resolve(entryPath);
+  let absoluteEntry: string;
+  try {
+    absoluteEntry = fs.realpathSync(linkedEntry);
+  } catch {
+    absoluteEntry = linkedEntry;
+  }
+  const rootDir = path.dirname(absoluteEntry);
+  const files: Record<string, string> = {};
+  const seen = new Set<string>();
+
+  const key = (abs: string): string =>
+    path.relative(rootDir, abs).split(path.sep).join("/");
+
+  // Canonical path -> the key it was first collected under. `path.resolve`
+  // normalizes `.` and `..` but NOT symlinks, so without this a file reached
+  // both directly and through a symlink lands under two keys — and a
+  // VirtualFileSystem has no notion of symlinks to collapse them again, so the
+  // loader would read the same directives twice and silently double every
+  // amount in that file. `rledger check` resolves the link, loads it once, and
+  // reports the duplicate.
+  const canonical = new Map<string, string>();
+
+  const visit = (abs: string): void => {
+    if (seen.has(abs)) return;
+    seen.add(abs);
+
+    let real: string;
+    try {
+      real = fs.realpathSync(abs);
+    } catch {
+      real = abs;
+    }
+
+    const firstKey = canonical.get(real);
+    if (firstKey !== undefined) {
+      // An alias for a file already in the map. It still has to RESOLVE — the
+      // include names this path — so stand in a one-line include of the
+      // canonical copy rather than the contents. The loader then reaches the
+      // same file twice and says so, which is what the CLI does, instead of
+      // counting it twice.
+      const target = path
+        .relative(path.dirname(abs), path.resolve(rootDir, firstKey))
+        .split(path.sep)
+        .join("/");
+      files[key(abs)] = `include "${target}"\n`;
+      return;
+    }
+
+    let content: string;
+    try {
+      content = fs.readFileSync(abs, "utf-8");
+    } catch {
+      // Leave it out and let the loader report the missing include against
+      // whichever file asked for it — better placed than anything we could say.
+      return;
+    }
+    canonical.set(real, key(abs));
+    files[key(abs)] = content;
+
+    const baseDir = path.dirname(abs);
+    // Fresh regex per call: a shared global one carries `lastIndex` across
+    // recursive invocations.
+    const includeRe = new RegExp(INCLUDE_PATTERN, "gm");
+    for (const match of content.matchAll(includeRe)) {
+      let targets: string[];
+      try {
+        targets = resolveIncludeTargets(match[1], baseDir);
+      } catch {
+        // A pattern matching nothing is the loader's to report.
+        continue;
+      }
+      for (const target of targets) visit(target);
+    }
+  };
+
+  visit(absoluteEntry);
+  return { files, entry: key(absoluteEntry) };
+}
+
+/*
+ * `loadWithIncludes` / `loadFileRecursive` used to live here: they
+ * concatenated a ledger's included files into one string for validation and
+ * querying. They are gone deliberately. That approach reimplemented the
+ * loader's include handling in TypeScript — getting diamonds, duplicate
+ * reporting, globs and directory matches wrong in turn — and, because the
+ * result was one anonymous buffer, reported an error on line 2 of an included
+ * file as `file: null, line: 9`.
+ *
+ * `collectLedgerFiles` above gathers the same files into the map the wasm
+ * multi-file entry points take, and the loader does the resolving. Keeping a
+ * concatenating entry point around would just be somewhere to reintroduce all
+ * of it.
+ *
+ * `withIncludedContext` below still concatenates, correctly: the editor tools
+ * need ONE buffer with the user's unsaved document first so a cursor offset
+ * still resolves against it, and they report no file-attributed diagnostics.
+ */
 
 /**
  * Build a whole-ledger source for the *aggregate* editor tools (hover,
@@ -105,25 +232,42 @@ function appendIncludes(
   // state across recursive invocations.
   const includeRe = new RegExp(INCLUDE_PATTERN, 'gm');
   for (const match of source.matchAll(includeRe)) {
-    const includeAbsPath = path.resolve(baseDir, match[1]);
-    // A single global `visited` set, added to BEFORE recursing, both
-    // de-duplicates a diamond graph (a shared file is appended once, which is
-    // what aggregate counts want) and makes a cycle (A -> B -> A) terminate
-    // without re-appending. Unlike `loadWithIncludes`, this does NOT throw on a
-    // cycle: an aggregate lookup for hover/completions stays useful even if the
-    // ledger has an include cycle elsewhere, rather than failing the whole tool.
-    if (visited.has(includeAbsPath)) continue;
-    visited.add(includeAbsPath);
-    let content: string;
+    // Glob-aware, the same way `collectLedgerFiles` is and through the same
+    // resolver: an aggregate lookup over a ledger written as
+    // `include "journals/*.beancount"` used to throw ENOENT on the pattern and
+    // take hover and completions down with it.
+    let targets: string[];
     try {
-      content = fs.readFileSync(includeAbsPath, "utf-8");
+      targets = resolveIncludeTargets(match[1], baseDir);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to include "${match[1]}": ${msg}`);
     }
-    out.push(content);
-    // Nested includes resolve relative to the included file's directory.
-    appendIncludes(content, path.dirname(includeAbsPath), visited, out);
+
+    for (const includeAbsPath of targets) {
+      // A single global `visited` set, added to BEFORE recursing, both
+      // de-duplicates a diamond graph (a shared file is appended once, which
+      // is what aggregate counts want) and makes a cycle (A -> B -> A)
+      // terminate without re-appending.
+      //
+      // Terminating quietly is the whole behavior here, deliberately. Unlike
+      // the validation path there is no loader behind this to report the
+      // cycle — this assembles one buffer for hover and completions, which
+      // should keep working on a ledger that has a cycle elsewhere rather
+      // than failing the tool outright.
+      if (visited.has(includeAbsPath)) continue;
+      visited.add(includeAbsPath);
+      let content: string;
+      try {
+        content = fs.readFileSync(includeAbsPath, "utf-8");
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to include "${match[1]}": ${msg}`);
+      }
+      out.push(content);
+      // Nested includes resolve relative to the included file's directory.
+      appendIncludes(content, path.dirname(includeAbsPath), visited, out);
+    }
   }
 }
 
@@ -195,10 +339,53 @@ export function jsonResponse(data: unknown): ToolResponse {
 export function formatErrors(errors: BeancountError[]): string {
   return errors
     .map((e) => {
-      const loc = e.line ? `:${e.line}${e.column ? `:${e.column}` : ""}` : "";
-      return `[${e.severity}]${loc} ${e.message}`;
+      // Name the file when the loader knows it. On a ledger split across
+      // monthly journals a bare `:561` is close to useless — 561 of which
+      // file? The multi-file entry points attribute each error to the file it
+      // is actually in, so say so.
+      const where = [e.file, e.line, e.line ? e.column : undefined]
+        .filter((part) => part !== null && part !== undefined && part !== "")
+        .join(":");
+      return where ? `[${e.severity}] ${where}: ${e.message}` : `[${e.severity}] ${e.message}`;
     })
     .join("\n");
+}
+
+/**
+ * The diagnostics that make a result unusable.
+ *
+ * A warning does not. The wasm entry points carry non-fatal notices in the
+ * same `errors` array as real failures — `query` documents that it passes
+ * "load warnings through every result path so callers still see them" — so a
+ * bare `errors.length > 0` treats a plugin notice as a hard failure. That is
+ * how a `query` on a ledger with an `unrealized` plugin returned the warning
+ * and THREW AWAY the rows, where `rledger query` prints them.
+ */
+export function fatalErrors(errors?: BeancountError[]): BeancountError[] {
+  return (errors ?? []).filter((e) => e.severity === "error");
+}
+
+/**
+ * Render a validation result the way `rledger check` reports one.
+ *
+ * Warnings are NOT errors — a warning-only ledger is valid and the CLI exits 0
+ * — but they still have to be shown. Reporting only when `valid` is false
+ * meant a ledger the CLI describes as `⚠ 1 warning` came back as a bare
+ * "Ledger is valid.", with the tool's own description promising "validation
+ * errors and warnings".
+ */
+export function formatValidation(result: ValidationOutcome, prefix = ""): string {
+  const head = prefix ? `${prefix}: ` : "";
+  const warnings = result.errors.filter((e) => e.severity === "warning");
+
+  if (!result.valid) {
+    const errorCount = result.errors.length - warnings.length;
+    return `${head}Found ${errorCount} error(s):\n${formatErrors(result.errors)}`;
+  }
+  if (warnings.length > 0) {
+    return `${head}Ledger is valid, with ${warnings.length} warning(s):\n${formatErrors(warnings)}`;
+  }
+  return `${head}Ledger is valid.`;
 }
 
 /**
