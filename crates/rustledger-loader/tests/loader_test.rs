@@ -1808,18 +1808,16 @@ fn precision_metadata_string_value_falls_back() {
 
 #[test]
 fn same_date_directives_keep_file_order_after_booking() {
-    // Issue #1049: the loader's pre-booking sort uses
-    // `(date, priority, has_cost_reduction)` so the booking engine
-    // sees augmentations before reductions on the same date (issue
-    // #841). After booking runs, we re-sort by `(date, priority,
-    // file_id, span.start)` to match Python beancount's
-    // `(date, type_priority, lineno)` order — otherwise BQL output
-    // diverges from bean-query on same-date tie-breaks.
+    // Issue #1049: directives reach downstream consumers in Python's
+    // `(date, type_priority, lineno)` order, so BQL output does not
+    // diverge from bean-query on same-date tie-breaks.
     //
-    // This fixture has a Sell stamped *before* a Buy in the file but
-    // on the same date. Booking reorders them so the Buy creates the
-    // lot first; the post-booking re-sort then restores file order
-    // for downstream consumers.
+    // This fixture has a Sell stamped *before* a Buy on the same date.
+    // Booking no longer reorders them (#2093 — that reordering changed
+    // which lots a match could see), so this pins the property directly:
+    // what booking iterated is what consumers see. The Sell names its lot
+    // explicitly, so it resolves against the earlier-dated purchase and is
+    // order-independent.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("same_date_order.beancount");
     std::fs::write(
@@ -1832,21 +1830,26 @@ fn same_date_directives_keep_file_order_after_booking() {
   Assets:Cash       2000.00 USD
   Equity:Opening   -2000.00 USD
 
+2024-01-12 * "Buy — the lot the Sell names"
+  Assets:Stock     10 STK {100.00 USD}
+  Assets:Cash   -1000.00 USD
+
 2024-01-15 * "Sell — appears first in file"
   Assets:Stock     -5 STK {100.00 USD}
   Assets:Cash     500.00 USD
 
-2024-01-15 * "Buy — appears second in file but creates the lot"
-  Assets:Stock     10 STK {100.00 USD}
-  Assets:Cash   -1000.00 USD
+2024-01-15 * "Buy — appears second in file, same date as the Sell"
+  Assets:Stock     10 STK {120.00 USD}
+  Assets:Cash   -1200.00 USD
 "#,
     )
     .unwrap();
     let options = LoadOptions::default();
     let ledger = load(&path, &options).expect("should load");
 
-    // Booking succeeded — the Sell found a matching lot from the Buy
-    // even though it's textually earlier (issue #841).
+    // Booking succeeded: the Sell names {100.00 USD}, which the
+    // 2024-01-12 purchase supplies, so the same-date Buy at {120.00 USD}
+    // is irrelevant to it.
     assert!(
         ledger
             .errors
@@ -1887,6 +1890,134 @@ fn same_date_directives_keep_file_order_after_booking() {
     assert!(
         txns_on_date[1].starts_with("Buy"),
         "textually-second Buy should come second, got: {txns_on_date:?}"
+    );
+}
+
+#[test]
+fn same_date_buy_after_sell_does_not_make_an_empty_cost_spec_ambiguous() {
+    // #2093. The Sell uses an empty cost spec and is written BEFORE a
+    // same-date Buy. At the moment the Sell books, the account holds exactly
+    // one lot, so `{}` is unambiguous — which is what Python reports, because
+    // it books same-date entries by `lineno`.
+    //
+    // Booking used to float cost augmentations ahead of reductions within a
+    // date (#841), which put the second lot in the inventory before the Sell
+    // ran and turned an unambiguous `{}` into an AmbiguousMatch. #841 itself
+    // does not need that reordering: see `booking_sort_key`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("same_date_empty_spec.beancount");
+    std::fs::write(
+        &path,
+        r#"2020-01-01 open Assets:Invest:Stock AAPL
+2020-01-01 open Income:Gains USD
+2020-01-01 open Assets:Cash USD
+
+2020-01-01 * "Deposit"
+  Assets:Cash        5000 USD
+  Income:Gains      -5000 USD
+
+2020-06-01 * "Buy 10 AAPL"
+  Assets:Invest:Stock  10 AAPL {100 USD}
+  Assets:Cash       -1000 USD
+
+2020-12-01 * "Sell 10 AAPL"
+  Assets:Invest:Stock -10 AAPL {} @ 120 USD
+  Assets:Cash        1200 USD
+  Income:Gains       -200 USD
+
+2020-12-01 * "Buy 20 AAPL"
+  Assets:Invest:Stock  20 AAPL {130 USD}
+  Assets:Cash       -2600 USD
+
+2020-12-02 balance Assets:Invest:Stock  20 AAPL
+2020-12-02 balance Assets:Cash         2600 USD
+"#,
+    )
+    .unwrap();
+    let ledger = load(&path, &LoadOptions::default()).expect("should load");
+    let errors: Vec<_> = ledger
+        .errors
+        .iter()
+        .filter(|e| matches!(e.severity, ErrorSeverity::Error))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "the sell sees one lot when it books, so `{{}}` is unambiguous, and \
+         both balance assertions hold: {errors:?}"
+    );
+}
+
+#[test]
+fn same_date_reordering_does_not_change_which_lot_hifo_selects() {
+    // #2093, the silent half. The reordering did not only turn valid ledgers
+    // into errors — where it did NOT error it could still change the answer.
+    //
+    // HIFO takes the highest-cost lot available *at the moment the sale
+    // books*. Here the expensive lot is bought after the sale in file order,
+    // so Python never offers it to the sale: the cheap lot goes, and 5 X
+    // {50} + 10 X {80} = 1050.00 USD of basis remains. Floating the buys
+    // ahead of the sale offered HIFO the expensive lot instead, leaving
+    // 10 X {50} + 5 X {80} = 900.00 USD.
+    //
+    // Neither version reports an error. Verified against beancount 3.2.3,
+    // which answers 1050.00 USD.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hifo_same_date.beancount");
+    std::fs::write(
+        &path,
+        r#"option "operating_currency" "USD"
+2020-01-01 open Assets:Inv "HIFO"
+2020-01-01 open Assets:Cash
+2020-01-01 open Income:PnL
+
+2020-06-01 * "buy cheap"
+  Assets:Inv    10 X {50.00 USD}
+  Assets:Cash  -500.00 USD
+
+2020-06-01 * "sell"
+  Assets:Inv    -5 X {} @ 90.00 USD
+  Assets:Cash  450.00 USD
+  Income:PnL
+
+2020-06-01 * "buy expensive - written AFTER the sell"
+  Assets:Inv    10 X {80.00 USD}
+  Assets:Cash  -800.00 USD
+"#,
+    )
+    .unwrap();
+    let ledger = load(&path, &LoadOptions::default()).expect("should load");
+    assert!(
+        ledger
+            .errors
+            .iter()
+            .all(|e| !matches!(e.severity, ErrorSeverity::Error)),
+        "fixture books cleanly on both sides of this fix; that is the point"
+    );
+
+    // Which lot did the sale take? Assert on the booked cost, not on the
+    // absence of errors — an error is exactly what this case does NOT
+    // produce when it is wrong.
+    let sold_at = ledger
+        .directives
+        .iter()
+        .find_map(|d| match &d.value {
+            rustledger_core::Directive::Transaction(t) if t.narration.as_str() == "sell" => t
+                .postings
+                .iter()
+                .find(|p| p.account.as_str() == "Assets:Inv")
+                .and_then(|p| p.cost.as_ref())
+                .and_then(|c| c.number.as_ref()),
+            _ => None,
+        })
+        .expect("the sell posting should be booked against a lot");
+    let rustledger_core::CostNumber::PerUnit { value } = sold_at else {
+        panic!("expected a resolved per-unit cost, got {sold_at:?}");
+    };
+    assert_eq!(
+        *value,
+        rust_decimal::Decimal::new(5000, 2),
+        "HIFO must take the 50.00 lot -- the only one bought before this sale. \
+         Taking 80.00 means a same-date buy written later was floated ahead of it."
     );
 }
 
