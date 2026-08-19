@@ -4,6 +4,7 @@
 //! `STRICT_WITH_SIZE`, FIFO, LIFO, HIFO, AVERAGE, NONE) used to reduce positions
 //! from an inventory.
 
+use jiff::civil::Date as NaiveDate;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::Signed;
 
@@ -270,33 +271,64 @@ impl Inventory {
                 Ok((result, ReductionPlan::FromLot { idx, new_units }))
             }
             n => {
-                // Are the matched lots financially interchangeable? Two lots
-                // count as identical if they have the same cost number + cost
-                // currency — the user-visible monetary identity. Date and label
-                // differences don't make a reduction ambiguous because the user
-                // could not have observed a different outcome based on the cost
-                // spec they wrote. Beancount falls back to FIFO in that case.
-                let first_key = self.positions[matching_indices[0]]
-                    .cost
-                    .as_ref()
-                    .map(|c| (c.number, c.currency.clone()));
-                let all_same_value = matching_indices.iter().skip(1).all(|&i| {
-                    let key = self.positions[i]
-                        .cost
-                        .as_ref()
-                        .map(|c| (c.number, c.currency.clone()));
-                    key == first_key
-                });
+                // Two or more lots match, so the spec the user wrote does not
+                // name one. STRICT's contract is to refuse to guess, and this
+                // arm is deliberately the whole of it — the only escape is the
+                // total-match exception below.
+                //
+                // The one escape besides that is lots which are identical in
+                // EVERY cost field — number, currency, date and label. Those
+                // are indistinguishable by construction, so draining them in
+                // date order cannot be observed.
+                //
+                // This used to compare the number and currency ALONE, on the
+                // stated grounds that "the user could not have observed a
+                // different outcome" and that "beancount falls back to FIFO in
+                // that case". Both were wrong (#2097). Beancount's
+                // `booking_method_STRICT` has no fallback at all: more than one
+                // match is the total-match exception or an
+                // `AmbiguousMatchError`. And ignoring the date made the outcome
+                // very much observable — selling 16 of
+                // `4 GLOB {74.09, 2022-05-10}` + `16 GLOB {74.09, 2024-02-09}`
+                // leaves 4 GLOB dated 2024 under FIFO and 4 GLOB dated 2022
+                // under any other choice. Same cost basis, which is what made
+                // it quiet, but a different HOLDING PERIOD — and this codebase
+                // acts on holding periods, in `report capgains`'s short/long
+                // split and in the per-lot IRR eligibility predicate. That is a
+                // tax-visible decision, made silently, under the one booking
+                // method whose entire purpose is to make the user state it.
+                //
+                // Why keep the narrowed form rather than delete it outright:
+                // beancount's `Inventory` is keyed by `(currency, cost)`, so
+                // two buys of the same commodity at the same price on the same
+                // day are ONE position there and can never be ambiguous. Ours
+                // stays two lots, so deleting this arm would reject a ledger
+                // beancount accepts — a very ordinary one. Comparing the full
+                // cost reproduces beancount's observable behavior without
+                // changing how positions are stored; merging them at `add`
+                // would be the more faithful model and a much larger change
+                // (`Inventory::len` counts lots, and `currency_accounts`
+                // branches on it).
+                //
+                // The user disambiguates by naming the lot: `{74.09 USD,
+                // 2022-05-10}`, a label, or an account booked FIFO/HIFO if
+                // they genuinely do not care which goes.
+                let first_cost = self.positions[matching_indices[0]].cost.as_ref();
+                let all_indistinguishable = matching_indices
+                    .iter()
+                    .skip(1)
+                    .all(|&i| self.positions[i].cost.as_ref() == first_cost);
 
-                if all_same_value {
+                if all_indistinguishable {
                     let (result, updates) =
                         self.plan_ordered(units, spec, LotOrder::Date, false)?;
                     return Ok((result, ReductionPlan::Updates(updates)));
                 }
 
                 // Total match exception: if the reduction equals the sum of all
-                // matching lots, the user is selling the entire matched
-                // inventory and the lot choice doesn't matter — accept it.
+                // matching lots, every matched lot is consumed, so no lot
+                // survives to carry a date and the choice cannot be observed.
+                // Beancount has this same exception, and for the same reason.
                 let total_units: Decimal = matching_indices
                     .iter()
                     .map(|&i| self.positions[i].units.number.abs())
@@ -363,11 +395,40 @@ impl Inventory {
             }),
             1 => from_lot(matching_indices[0]),
             n => {
-                // A lot of exactly the reduction's size disambiguates.
+                // A lot of exactly the reduction's size disambiguates. When
+                // SEVERAL do, the OLDEST wins — beancount sorts the size
+                // matches by `cost.date` and takes the first, and the choice
+                // is observable in both the basis realized and the holding
+                // period of whatever survives.
+                //
+                // This used to take the first candidate in slot order, which
+                // is insertion order. That is usually date order and so
+                // usually agreed by accident, but a lot carrying an explicit
+                // cost date (`{100.00 USD, 2030-01-01}`) is inserted when its
+                // transaction is booked and dated whenever the user said. Buy
+                // 10 X {100.00, 2030-01-01} then 10 X {200.00, 2020-01-01} and
+                // sell 10 X {}: beancount sells the 2020 lot and leaves 1000
+                // USD of basis, slot order sells the 2030 lot and leaves 2000.
+                // Neither reports anything.
+                //
+                // Ties break on slot index so the result stays deterministic
+                // when two size matches share a date; `None` dates sort last,
+                // since a booked lot always has one and an unbooked lot is not
+                // the one the user meant.
                 let exact = matching_indices
                     .iter()
                     .copied()
-                    .find(|&i| self.positions[i].units.number.abs() == units.number.abs());
+                    .filter(|&i| self.positions[i].units.number.abs() == units.number.abs())
+                    .min_by_key(|&i| {
+                        (
+                            self.positions[i]
+                                .cost
+                                .as_ref()
+                                .and_then(|c| c.date)
+                                .map_or((1, NaiveDate::MAX), |d| (0, d)),
+                            i,
+                        )
+                    });
                 if let Some(idx) = exact {
                     return from_lot(idx);
                 }
@@ -1734,6 +1795,29 @@ mod reduction_tests {
         let inv = mk([lot(10, 100, 1), lot(5, 200, 2)]);
         let r = try_reduce(&inv, &sell_stk(5), BookingMethod::StrictWithSize);
         assert_eq!(basis(&r), dec!(1000)); // 5 @ $200, the exact-size lot
+    }
+
+    #[test]
+    fn strict_with_size_takes_the_oldest_of_several_exact_size_lots() {
+        // #2097. Two lots of the reduction's size, so size alone does not
+        // disambiguate. Beancount sorts the size matches by `cost.date` and
+        // takes the first; the choice decides both the basis realized and the
+        // holding period of what survives.
+        //
+        // The lots are built in the OPPOSITE order to their dates, which is
+        // what the old `find`-first-in-slot-order got wrong. Slot order is
+        // insertion order and usually matches date order by accident — but a
+        // lot carrying an explicit cost date is inserted when its transaction
+        // books and dated whenever the user wrote. Verified against beancount
+        // 3.2.3, which leaves the 100-cost lot standing.
+        let inv = mk([lot(10, 100, 20), lot(10, 200, 5)]);
+        let r = try_reduce(&inv, &sell_stk(10), BookingMethod::StrictWithSize);
+        assert_eq!(
+            basis(&r),
+            dec!(2000),
+            "must realize the OLDEST size match (day 5, cost 200), not the \
+             first one stored (day 20, cost 100)"
+        );
     }
 
     #[test]
