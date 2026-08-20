@@ -246,8 +246,21 @@ impl CacheEntry {
             // and silently skip a non-UTF8 source file, leaving the
             // cache-hit source map missing text the uncached run has -
             // an error-reporting parity gap.
+            //
+            // Structured exactly as `DiskFileSystem::read` rather than as
+            // `from_utf8_lossy(&bytes).into_owned()`, which is the same
+            // operation by a much slower route: it validates through
+            // `Utf8Chunks` a byte at a time instead of the word-at-a-time
+            // check `String::from_utf8` runs, and then copies the whole file
+            // even when every byte was already valid. `String::from_utf8`
+            // takes the `Vec` by value and keeps the allocation. Only a
+            // genuinely non-UTF-8 file pays for the lossy rebuild, and that
+            // branch produces the identical string.
             if let Ok(bytes) = fs::read(&path) {
-                let content = String::from_utf8_lossy(&bytes).into_owned();
+                let content = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                };
                 source_map.add_file(path, content.into());
             }
         }
@@ -432,12 +445,18 @@ const CACHE_MAGIC: &[u8; 8] = b"RLEDGER\0";
 ///     OUTPUT, so a stale cache would keep serving `-0.00` from a build that
 ///     no longer produces one.
 ///
+/// v29: `Posting::cost` and `Posting::price` are boxed. rkyv mirrors the
+///     in-memory layout, so `ArchivedPosting` changed shape — a v28 file read
+///     as v29 would interpret an inline `CostSpec` as a relative pointer.
+///     This is a layout change rather than a content change, so unlike the
+///     entries above nothing about the ledger's meaning moved.
+///
 /// Public so `rustledger-wasm` can pin its own cache version against this one.
 /// Both caches archive the same `Vec<Directive>`, so a parser change that
 /// alters PARSER OUTPUT has to bump both — and on #1942 only this one was
 /// bumped, which review caught rather than any test. See
 /// `loader_cache_version_is_pinned` in `rustledger-wasm/src/cache.rs`.
-pub const CACHE_VERSION: u32 = 28;
+pub const CACHE_VERSION: u32 = 29;
 
 /// Cache header stored at the start of cache files.
 #[derive(Debug, Clone)]
@@ -644,7 +663,21 @@ pub fn load_cache_entry(main_file: &Path) -> Option<CacheEntry> {
     file.read_exact(&mut data).ok()?;
 
     // Deserialize
-    let entry: CacheEntry = rkyv::from_bytes::<CacheEntry, rkyv::rancor::Error>(&data).ok()?;
+    // Intern while deserializing rather than deduplicating afterwards.
+    // rkyv's deserializer carries no interner, so `AsInternedStr` handed
+    // every occurrence its own `Arc<str>` — 40,015 of them on a
+    // 10,000-transaction ledger holding a few dozen distinct strings — and
+    // the caller then walked every directive again through
+    // `reintern_directives` to collapse them. The scope establishes the same
+    // postcondition (equal strings share a pointer) on the way in, so the
+    // second walk is redundant on this path; see `load_result_cached`.
+    //
+    // The guard drops at the end of this function, including on the `?`
+    // paths below, so nothing outlives the load.
+    let entry: CacheEntry = {
+        let _intern = rustledger_core::intern::InternScope::new();
+        rkyv::from_bytes::<CacheEntry, rkyv::rancor::Error>(&data).ok()?
+    };
 
     // Validate hash against the files stored in the cache
     let file_paths = entry.file_paths();
@@ -742,7 +775,7 @@ mod tests {
     use super::*;
     use crate::dedup::reintern_directives;
     use rust_decimal_macros::dec;
-    use rustledger_core::{Amount, Posting, Transaction};
+    use rustledger_core::{Amount, IncompleteAmount, Posting, Transaction};
     use rustledger_parser::Span;
 
     #[test]
@@ -1156,7 +1189,7 @@ mod tests {
         // v25 (#2008) is another v15: transaction headers beancount rejects now
         // produce a parse error. That changes WHICH errors are emitted, not how
         // a `CostNumber` is archived, so the byte arrays are still valid.
-        const FIXTURE_VERSION: u32 = 28;
+        const FIXTURE_VERSION: u32 = 29;
         assert_eq!(
             CACHE_VERSION, FIXTURE_VERSION,
             "CACHE_VERSION advanced past the fixture version; regenerate \
@@ -1257,7 +1290,7 @@ mod tests {
         // an UNSIGNED zero. Like v19 that changes which VALUE a source text
         // produces, not the variants or their encodings, so the hash below
         // must still match — and the assertion, not this comment, proves it.
-        const FIXTURE_VERSION: u32 = 28;
+        const FIXTURE_VERSION: u32 = 29;
         const META_VALUE_LAYOUT_HASH: &str =
             "43e3c258fe376cede6a6c2c975100bcf67ddda0ab84b21566b123c01e0a54b25";
         assert_eq!(
@@ -1327,6 +1360,165 @@ mod tests {
         // - "Assets:Checking" appears 5 times but only first is new (4 dedup)
         // Total: 12 deduplications
         assert_eq!(dedup_count, 12);
+    }
+
+    /// The property `load_result_cached` relies on when it skips
+    /// `reintern_directives`: deserializing under an `InternScope` leaves
+    /// equal strings sharing one `Arc`, which is exactly what that pass
+    /// exists to guarantee.
+    ///
+    /// Asserts the NEGATIVE half first. Without the scope every occurrence
+    /// gets its own `Arc`, so if the scope ever stopped working this test
+    /// would still be checking something real rather than passing because
+    /// `ptr_eq` happened to hold for another reason.
+    #[test]
+    fn cache_hit_directives_share_one_arc_per_distinct_string() {
+        let date = rustledger_core::naive_date(2024, 1, 15).unwrap();
+        let mut directives = vec![];
+        for _ in 0..5 {
+            // Every field the same, so each of the four categories below has
+            // five occurrences of one string to share.
+            let txn = Transaction::new(date, "SAME-NARRATION")
+                .with_payee("SAME-PAYEE")
+                .with_synthesized_posting(Posting::new(
+                    "Expenses:Food",
+                    Amount::new(dec!(10.00), "USD"),
+                ))
+                .with_synthesized_posting(Posting::auto("Assets:Checking"));
+            directives.push(Spanned::new(Directive::Transaction(txn), Span::new(0, 50)));
+        }
+
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&directives).expect("directives serialize");
+
+        // All four categories of `InternedStr` a transaction carries, because
+        // `reintern_directives` covers all of them and skipping it is only
+        // sound if the scope does too. `account` reaches `AsInternedStr`
+        // through the `Account` newtype and `currency` through `Amount`,
+        // neither of which names the wrapper at the field, so covering one
+        // does not imply covering the others.
+        let pairs = |ds: &[Spanned<Directive>]| {
+            let pick = |d: &Spanned<Directive>| match &d.value {
+                Directive::Transaction(t) => {
+                    let currency = match &t.postings[0].units {
+                        Some(IncompleteAmount::Complete(a)) => a.currency.clone(),
+                        other => panic!("expected complete units, got {other:?}"),
+                    };
+                    (
+                        t.postings[0].account.clone(),
+                        currency,
+                        t.payee.clone().expect("payee"),
+                        t.narration.clone(),
+                    )
+                }
+                other => panic!("expected a transaction, got {other:?}"),
+            };
+            (pick(&ds[0]), pick(&ds[4]))
+        };
+
+        let plain: Vec<Spanned<Directive>> =
+            rkyv::from_bytes::<Vec<Spanned<Directive>>, rkyv::rancor::Error>(&bytes)
+                .expect("deserialize without a scope");
+        let (x, y) = pairs(&plain);
+        assert_eq!(x.0.as_str(), y.0.as_str());
+        assert!(
+            !x.0.ptr_eq(&y.0) && !x.1.ptr_eq(&y.1) && !x.2.ptr_eq(&y.2) && !x.3.ptr_eq(&y.3),
+            "without an InternScope each occurrence should get its own Arc - \
+             if this now holds, the positive assertions below prove nothing"
+        );
+
+        let scoped: Vec<Spanned<Directive>> = {
+            let _intern = rustledger_core::intern::InternScope::new();
+            rkyv::from_bytes::<Vec<Spanned<Directive>>, rkyv::rancor::Error>(&bytes)
+                .expect("deserialize under a scope")
+        };
+        let (x, y) = pairs(&scoped);
+        for (label, shared) in [
+            ("account", x.0.ptr_eq(&y.0)),
+            ("currency", x.1.ptr_eq(&y.1)),
+            ("payee", x.2.ptr_eq(&y.2)),
+            ("narration", x.3.ptr_eq(&y.3)),
+        ] {
+            assert!(
+                shared,
+                "under an InternScope {label} must share one Arc, which is \
+                 what lets the cache-hit path skip reintern_directives"
+            );
+        }
+    }
+
+    /// Deserialize `bytes` (optionally under a scope) and return the account
+    /// of the first transaction. Interning only happens inside
+    /// `AsInternedStr::deserialize_with`, so a scope test that builds an
+    /// `InternedStr` directly proves nothing — `InternedStr::new` does not
+    /// consult the scope at all.
+    fn first_account(bytes: &[u8]) -> rustledger_core::Account {
+        let ds = rkyv::from_bytes::<Vec<Spanned<Directive>>, rkyv::rancor::Error>(bytes)
+            .expect("deserialize");
+        match &ds[0].value {
+            Directive::Transaction(t) => t.postings[0].account.clone(),
+            other => panic!("expected a transaction, got {other:?}"),
+        }
+    }
+
+    /// The table must not outlive its guard, or a long-running host would
+    /// accumulate every string it ever deserialized.
+    #[test]
+    fn the_intern_scope_stops_interning_once_the_guard_drops() {
+        let bytes = one_txn_archive();
+        let inside = {
+            let _intern = rustledger_core::intern::InternScope::new();
+            let a = first_account(&bytes);
+            // Same scope, second deserialization: shares.
+            assert!(first_account(&bytes).ptr_eq(&a));
+            a
+        };
+        // The guard has dropped, so a fresh deserialization cannot reach the
+        // table that produced `inside`.
+        let after = first_account(&bytes);
+        assert_eq!(inside.as_str(), after.as_str());
+        assert!(
+            !inside.ptr_eq(&after),
+            "the table must be gone once the guard drops"
+        );
+    }
+
+    /// An inner scope must not pull the table out from under an outer one
+    /// when it drops. `InternScope::new` returns a guard either way, so
+    /// without the `installed` flag the inner `Drop` would clear the table
+    /// and silently stop interning for the rest of the outer scope — which
+    /// no assertion about a single scope would notice.
+    #[test]
+    fn a_nested_intern_scope_leaves_the_outer_one_interning() {
+        let bytes = one_txn_archive();
+        let outer = rustledger_core::intern::InternScope::new();
+        let first = first_account(&bytes);
+        {
+            let _inner = rustledger_core::intern::InternScope::new();
+            assert!(
+                first_account(&bytes).ptr_eq(&first),
+                "the inner scope should adopt the outer table, not replace it"
+            );
+        }
+        assert!(
+            first_account(&bytes).ptr_eq(&first),
+            "the outer scope must still be interning after the inner guard drops"
+        );
+        drop(outer);
+        assert!(!first_account(&bytes).ptr_eq(&first));
+    }
+
+    /// One archived transaction, for the scope tests above.
+    fn one_txn_archive() -> rkyv::util::AlignedVec {
+        let date = rustledger_core::naive_date(2024, 1, 15).unwrap();
+        let txn = Transaction::new(date, "N")
+            .with_synthesized_posting(Posting::new(
+                "Expenses:Food",
+                Amount::new(dec!(10.00), "USD"),
+            ))
+            .with_synthesized_posting(Posting::auto("Assets:Checking"));
+        let ds = vec![Spanned::new(Directive::Transaction(txn), Span::new(0, 50))];
+        rkyv::to_bytes::<rkyv::rancor::Error>(&ds).expect("serialize")
     }
 
     #[test]
