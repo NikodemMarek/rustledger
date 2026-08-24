@@ -555,7 +555,7 @@ impl Inventory {
                     .filter(|(_, p)| p.units.currency == units.currency)
                     .map(|(i, _)| i)
                     .collect();
-                all.sort_by_key(|&i| self.order_key(order, i));
+                all.sort_by_key(|&i| (self.order_key(order, i), i));
                 Some(all)
             };
         let candidates: &[usize] = match &scanned {
@@ -1658,6 +1658,91 @@ mod reduction_tests {
             "a lot added after the index was built must still sort newest-first",
         );
         assert_eq!(basis(&r), dec!(3000));
+    }
+
+    /// Reordering INTERCHANGEABLE acquisitions does not change what is
+    /// consumed.
+    ///
+    /// Two lots agreeing on commodity, cost, cost currency, date and label are
+    /// interchangeable: no recorded attribute separates them, so `add` stores
+    /// them as ONE position. That is what makes the outcome independent of the
+    /// order they happen to be written in, and it is why a cost basis no
+    /// longer depends on an editing accident (#2118).
+    ///
+    /// Before this rule, `A B C` and `A C B` disagreed by 50 USD of remaining
+    /// basis on exactly these fixtures.
+    ///
+    /// Both code paths are exercised deliberately. `try_reduce` on a fresh
+    /// inventory sorts a scanned list; a reduction after the index exists
+    /// places later acquisitions through `ordered_index_insert`.
+    #[test]
+    fn interchangeable_lots_consume_independently_of_write_order() {
+        let a = || lot(10, 10, 2);
+        let b = || lot(10, 20, 2);
+        let c = || lot(10, 10, 2);
+
+        // A and C merge, so any ledger writing B after the first acquisition
+        // holds the same two positions and consumes identically.
+        let consumed = |lots: [Position; 3]| -> Vec<(Decimal, Decimal)> {
+            let inv = mk(lots);
+            assert_eq!(inv.len(), 2, "A and C are interchangeable: one position");
+            try_reduce(&inv, &sell_stk(15), BookingMethod::Fifo)
+                .matched
+                .iter()
+                .map(|m| (m.cost.as_ref().unwrap().number, m.units.number.abs()))
+                .collect()
+        };
+
+        let after_first = [
+            ("A B C", consumed([a(), b(), c()])),
+            ("A C B", consumed([a(), c(), b()])),
+            ("C A B", consumed([c(), a(), b()])),
+            ("C B A", consumed([c(), b(), a()])),
+        ];
+        for (name, got) in &after_first {
+            assert_eq!(
+                got,
+                &vec![(dec!(10), dec!(15))],
+                "{name}: 15 units all come from the merged 10.00 position",
+            );
+        }
+
+        // The same property through the MAINTAINED INDEX rather than the scan.
+        let via_index = |lots: [Position; 3]| -> Vec<Decimal> {
+            let mut inv = mk([lots[0].clone()]);
+            inv.reduce(&sell_stk(1), None, BookingMethod::Fifo)
+                .expect("one unit is there");
+            for l in &lots[1..] {
+                inv.add(l.clone()).expect("fixture fits in Decimal");
+            }
+            inv.reduce(&sell_stk(14), None, BookingMethod::Fifo)
+                .expect("29 units remain")
+                .matched
+                .iter()
+                .map(|m| m.cost.as_ref().unwrap().number)
+                .collect()
+        };
+        assert_eq!(
+            via_index([a(), b(), c()]),
+            via_index([a(), c(), b()]),
+            "the maintained index must order merged lots the same way the scan does",
+        );
+
+        // B written FIRST is distinguishable and legitimately differs: it is
+        // not interchangeable with either of the others.
+        for (name, lots) in [("B A C", [b(), a(), c()]), ("B C A", [b(), c(), a()])] {
+            let inv = mk(lots);
+            let got: Vec<Decimal> = try_reduce(&inv, &sell_stk(15), BookingMethod::Fifo)
+                .matched
+                .iter()
+                .map(|m| m.cost.as_ref().unwrap().number)
+                .collect();
+            assert_eq!(
+                got,
+                vec![dec!(20), dec!(10)],
+                "{name}: B first must be consumed first, got {got:?}",
+            );
+        }
     }
 
     #[test]

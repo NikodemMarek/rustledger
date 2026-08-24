@@ -983,6 +983,7 @@ pub struct Inventory {
     /// Not serialized - rebuilt on demand, like the caches above.
     #[serde(skip)]
     cost_index: FxHashMap<CostKey, smallvec::SmallVec<[usize; 2]>>,
+
     /// EVERY lot per units-currency, in the order FIFO consumes them: lot date
     /// ascending, ties broken by slot ascending.
     ///
@@ -1025,6 +1026,8 @@ pub struct Inventory {
 /// One inventory needs one ordering, because an account has one booking
 /// method — so this is stored alongside the index rather than a second index
 /// being kept in step with the first.
+/// What makes two lots interchangeable: every attribute the model records.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LotOrder {
     /// Oldest lot first, which is what FIFO takes.
@@ -1056,6 +1059,10 @@ pub(super) struct OrderedIndex {
     /// Which ordering `by_currency` is sorted in.
     order: LotOrder,
     /// Slots per units-currency, sorted by `order` then slot ascending.
+    ///
+    /// No tiebreak beyond the slot is needed: `add` stores interchangeable
+    /// lots as ONE position (#2118), so a group has one slot rather than
+    /// several needing to be kept adjacent.
     by_currency: FxHashMap<crate::Currency, Vec<usize>>,
 }
 
@@ -1713,15 +1720,37 @@ impl Inventory {
         let new_cached = crate::decimal::checked_add_python_scale(cached, position.units.number)
             .ok_or_else(overflow)?;
 
-        let merge_idx = position
-            .cost
-            .is_none()
-            .then(|| {
+        // Merge into an existing lot when this acquisition is indistinguishable
+        // from one already held.
+        //
+        // Cost-less positions have always merged, through `simple_slot`. Lots
+        // agreeing on commodity, cost per unit, cost currency, acquisition
+        // date and label are indistinguishable in the same way: no attribute
+        // the model records separates them, so keeping them apart only lets
+        // the order they were WRITTEN decide which units a reduction consumes
+        // (#2118). Merging makes the group one position, which is what it
+        // already behaves as, and is what Python beancount stores.
+        //
+        // `cost_index` finds the target: it buckets by
+        // `(units currency, cost number, cost currency)` in slot order, so
+        // the first member agreeing on date and label is the one to join.
+        // Buckets are a `SmallVec<[usize; 2]>`.
+        let merge_idx = position.cost.as_ref().map_or_else(
+            || {
                 self.units_cache
                     .get(&position.units.currency)
                     .and_then(|s| s.simple_slot)
-            })
-            .flatten();
+            },
+            |cost| {
+                let key = cost_key(&position)?;
+                self.cost_index.get(&key)?.iter().copied().find(|&i| {
+                    self.positions
+                        .get(i)
+                        .and_then(|p| p.cost.as_ref())
+                        .is_some_and(|c| c.date == cost.date && c.label == cost.label)
+                })
+            },
+        );
         let merged_units = merge_idx
             .map(|idx| {
                 // Same rule as the units cache above — these two must agree,
@@ -1786,14 +1815,24 @@ impl Inventory {
         }
 
         // For positions without cost, use index for O(1) lookup
+        // Apply the merge, for a cost-bearing lot as much as a cost-less one.
+        // The target already carries the same cost, date and label, so only
+        // its units move: no index changes, because the slot is already in
+        // `cost_index` and in the ordered index at the position the group
+        // occupies. That is what keeps the group's place stable when part of
+        // it drains.
+        if let Some(idx) = merge_idx {
+            debug_assert_eq!(
+                self.positions[idx].cost.is_none(),
+                position.cost.is_none(),
+                "a merge target must match the incoming lot's cost-ness",
+            );
+            self.positions[idx].units.number =
+                merged_units.expect("merged_units is Some whenever merge_idx is");
+            return Ok(());
+        }
+
         if position.cost.is_none() {
-            if let Some(idx) = merge_idx {
-                // Merge with existing position
-                debug_assert!(self.positions[idx].cost.is_none());
-                self.positions[idx].units.number =
-                    merged_units.expect("merged_units is Some whenever merge_idx is");
-                return Ok(());
-            }
             // No existing position - add new one and index it
             // `push_slot`, not `len()`: with tombstones present the live
             // count is not the slot the lot lands in, and `simple_index`
@@ -1902,22 +1941,13 @@ impl Inventory {
         self.ordered_index = Some(index);
     }
 
-    /// Populate `ordered_index` from the current lots — all of them, cost-less
-    /// included, because an empty cost spec selects those too.
+    /// The value `order` sorts `slot` by.
     ///
-    /// Called the first time an ordered booking method reduces against this
-    /// inventory, then kept current incrementally. Ordering matches what
-    /// `plan_ordered` produced when it sorted per call: date ascending, slot
-    /// ascending within a date.
-    /// The value `order` sorts `slot` by. Ties fall through to the slot
-    /// number, which is what makes every ordering match the stable sorts they
-    /// replace: `sort_by_key(date)` and `sort_by_key(Reverse(cost))` both left
-    /// equal keys in ascending slot order.
-    ///
-    /// That ascending tiebreak is the same for ALL THREE orderings, including
-    /// the descending ones. A descending method reverses its KEY here; nothing
-    /// reverses the walk, because doing so reverses the tiebreak with it
-    /// (#2115).
+    /// Ties fall through to the slot number, which preserves source order.
+    /// That tiebreak is ascending for EVERY ordering, including
+    /// the descending ones: a descending method reverses its KEY here, and
+    /// nothing reverses the walk, because reversing the walk reverses the
+    /// tiebreak with it (#2115).
     fn order_key(&self, order: LotOrder, slot: usize) -> OrderKey {
         let cost = self.positions.get(slot).and_then(|p| p.cost.as_ref());
         match order {
@@ -1956,7 +1986,7 @@ impl Inventory {
                 .push(idx);
         }
         for slots in by_currency.values_mut() {
-            slots.sort_by_key(|&idx| self.order_key(order, idx));
+            slots.sort_by_key(|&idx| (self.order_key(order, idx), idx));
         }
         self.ordered_index = Some(Box::new(OrderedIndex { order, by_currency }));
     }
@@ -2282,7 +2312,7 @@ impl Inventory {
                 })
                 .unwrap_or_default();
             for (currency, mut slots) in keys {
-                slots.sort_by_key(|&idx| self.order_key(order, idx));
+                slots.sort_by_key(|&idx| (self.order_key(order, idx), idx));
                 if let Some(index) = self.ordered_index.as_mut() {
                     index.by_currency.insert(currency, slots);
                 }
@@ -3054,9 +3084,10 @@ mod tests {
     }
 
     #[test]
-    fn test_add_costed_positions_kept_separate() {
-        // Costed positions are kept as separate lots for O(1) add performance.
-        // Aggregation happens at display time (in query output).
+    fn test_add_nets_a_negative_of_the_same_identity() {
+        // Was `test_add_costed_positions_kept_separate`, which asserted that
+        // costed lots never merge. Interchangeable lots are now one position
+        // (#2118), so a negative of the same identity nets into it.
         let mut inv = Inventory::new();
 
         let cost = Cost::new(dec!(150.00), "USD").with_date(date(2024, 1, 1));
@@ -3070,11 +3101,13 @@ mod tests {
         assert_eq!(inv.len(), 1);
         assert_eq!(inv.units("AAPL"), dec!(10));
 
-        // Sell 10 shares - kept as separate lot for tracking
+        // A negative of the same identity nets into the lot: interchangeable
+        // positions are one position (#2118). The lot is left at zero units
+        // rather than removed, which `units()` already accounted for.
         inv.add(Position::with_cost(Amount::new(dec!(-10), "AAPL"), cost))
             .expect("fixture fits in Decimal");
-        assert_eq!(inv.len(), 2); // Both lots kept
-        assert_eq!(inv.units("AAPL"), dec!(0)); // Net units still zero
+        assert_eq!(inv.len(), 1, "same identity nets into one position");
+        assert_eq!(inv.units("AAPL"), dec!(0));
     }
 
     /// A deserialized inventory must report the same scale as one built by
@@ -3194,11 +3227,17 @@ mod tests {
         ))
         .expect("fixture fits in Decimal");
 
-        // Sell 3 shares - kept as separate lot
+        // Adding a NEGATIVE position of the same identity nets into the lot
+        // rather than sitting beside it. Interchangeable positions are one
+        // position, and that is as true of a negative one as a positive one.
+        //
+        // Note this is `add`, not `reduce`: booking a sale goes through
+        // `reduce`, which matches a lot and drains it. This path is for
+        // callers assembling an inventory directly.
         inv.add(Position::with_cost(Amount::new(dec!(-3), "AAPL"), cost))
             .expect("fixture fits in Decimal");
-        assert_eq!(inv.len(), 2); // Both lots kept
-        assert_eq!(inv.units("AAPL"), dec!(7)); // Net units correct
+        assert_eq!(inv.len(), 1, "same identity nets into one position");
+        assert_eq!(inv.units("AAPL"), dec!(7));
     }
 
     #[test]
@@ -3223,31 +3262,65 @@ mod tests {
     }
 
     #[test]
-    fn test_add_no_cancel_same_sign() {
-        // Test that same-sign positions don't merge even with same cost
+    fn test_add_merges_same_identity() {
+        // Two acquisitions agreeing on commodity, cost, cost currency, date
+        // and label are INTERCHANGEABLE: no attribute the model records
+        // separates them, so they are one position.
+        //
+        // This test previously asserted the opposite, that they stay separate.
+        // Keeping them apart let the order they were WRITTEN decide which
+        // units a later reduction consumed, so an unrelated lot written
+        // between them moved a reported cost basis (#2118).
         let mut inv = Inventory::new();
 
         let cost = Cost::new(dec!(150.00), "USD").with_date(date(2024, 1, 1));
 
-        // Buy 10 shares
         inv.add(Position::with_cost(
             Amount::new(dec!(10), "AAPL"),
             cost.clone(),
         ))
         .expect("fixture fits in Decimal");
-
-        // Buy 5 more shares with same cost - should NOT merge
         inv.add(Position::with_cost(Amount::new(dec!(5), "AAPL"), cost))
             .expect("fixture fits in Decimal");
 
-        // Should have two separate lots (different acquisitions)
-        assert_eq!(inv.len(), 2);
+        assert_eq!(inv.len(), 1, "interchangeable lots are one position");
+        assert_eq!(inv.units("AAPL"), dec!(15));
+    }
+
+    /// A LABEL makes otherwise identical lots distinct, so they do not merge.
+    ///
+    /// This is the boundary of the rule above: labels exist precisely to make
+    /// two same-day, same-cost acquisitions addressable apart, and merging
+    /// them would take that away.
+    #[test]
+    fn test_add_keeps_labelled_lots_separate() {
+        let mut inv = Inventory::new();
+        let at = |label: &str| {
+            Cost::new(dec!(150.00), "USD")
+                .with_date(date(2024, 1, 1))
+                .with_label(label)
+        };
+
+        inv.add(Position::with_cost(
+            Amount::new(dec!(10), "AAPL"),
+            at("morning"),
+        ))
+        .expect("fixture fits in Decimal");
+        inv.add(Position::with_cost(
+            Amount::new(dec!(5), "AAPL"),
+            at("afternoon"),
+        ))
+        .expect("fixture fits in Decimal");
+
+        assert_eq!(inv.len(), 2, "labels keep the lots addressable apart");
         assert_eq!(inv.units("AAPL"), dec!(15));
     }
 
     #[test]
-    fn test_merge_keeps_lots_separate() {
-        // Test that merge keeps costed lots separate (aggregation at display time)
+    fn test_merge_nets_the_same_identity() {
+        // Was `test_merge_keeps_lots_separate`. See #2118: interchangeable
+        // lots are one position, so merging two inventories holding the same
+        // identity yields one, not two.
         let mut inv1 = Inventory::new();
         let mut inv2 = Inventory::new();
 
@@ -3264,10 +3337,13 @@ mod tests {
         inv2.add(Position::with_cost(Amount::new(dec!(-10), "AAPL"), cost))
             .expect("fixture fits in Decimal");
 
-        // Merge keeps both lots, net units is zero
+        // `merge` adds each of the other inventory's positions, so the same
+        // identity lands in the same position rather than beside it. Net units
+        // are unchanged either way; what changes is that the result no longer
+        // depends on which inventory a lot came from.
         inv1.merge(&inv2).expect("fixture fits in Decimal");
-        assert_eq!(inv1.len(), 2); // Both lots preserved
-        assert_eq!(inv1.units("AAPL"), dec!(0)); // Net units correct
+        assert_eq!(inv1.len(), 1, "the same identity is one position");
+        assert_eq!(inv1.units("AAPL"), dec!(0));
     }
 
     // ====================================================================
@@ -5088,15 +5164,20 @@ mod tests {
             ))
             .expect("fits");
         }
-        // Two lots IDENTICAL by value. `add` never merges cost-bearing lots —
-        // it keeps them separate to match Python — so this is an ordinary
-        // inventory, and it is the shape that makes the assertion below
-        // meaningful: with only distinct lots, comparing by value cannot tell
-        // "the right slot" from "a slot holding an equal position".
-        for _ in 0..2 {
+        // Two lots equal in UNITS and COST, which is what makes the assertion
+        // below meaningful: with only distinct lots, comparing by value cannot
+        // tell "the right slot" from "a slot holding an equal position".
+        //
+        // They carry different labels so they stay two lots. `add` merges
+        // interchangeable lots now (#2118), and lots identical in every
+        // recorded attribute would collapse into one, taking the duplicate
+        // this test needs with them. The labels restore the shape without
+        // weakening the check: the positions still compare equal on units and
+        // cost, which is the trap being guarded against.
+        for label in ["first", "second"] {
             inv.add(Position::with_cost(
                 Amount::new(dec!(7), "AAPL"),
-                Cost::new(dec!(70), "USD"),
+                Cost::new(dec!(70), "USD").with_label(label),
             ))
             .expect("fits");
         }
