@@ -1238,6 +1238,17 @@ def main() -> int:
     ap.add_argument("--rledger", default="./target/release/rledger")
     ap.add_argument("--corpus", nargs="+")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument(
+        "--baseline",
+        help="JSON file of divergences already known and accepted. Any "
+             "divergence NOT listed makes this exit non-zero, so a NEW one "
+             "fails the build while the existing backlog does not.",
+    )
+    ap.add_argument(
+        "--write-baseline",
+        help="write the divergences found in this run to PATH and exit 0. "
+             "Use to record the current state, then review the diff.",
+    )
     ap.add_argument("--self-test", action="store_true",
                     help="verify the error axis on fixtures with known answers")
     args = ap.parse_args()
@@ -1247,6 +1258,13 @@ def main() -> int:
 
     if not args.corpus:
         ap.error("--corpus is required unless --self-test is given")
+
+    # --limit truncates the corpus, so `found` would be a subset of reality.
+    # Writing under it silently shrinks the baseline; checking under it reports
+    # every unvisited entry as RESOLVED and passes. Both look like success.
+    if args.limit and (args.baseline or args.write_baseline):
+        ap.error("--limit cannot be combined with --baseline/--write-baseline: "
+                 "a truncated corpus yields a partial divergence set")
     files = sorted(p for d in args.corpus for p in Path(d).rglob("*.beancount"))
     if args.limit:
         files = files[: args.limit]
@@ -1433,7 +1451,109 @@ def main() -> int:
         print(f"  {path}")
         for where, x, y in diffs[:6]:
             print(f"      {where}:  beancount={x}  rledger={y}")
+
+    # Gate on NEW divergences, not on any divergence.
+    #
+    # This comparison exists to catch "right shape, wrong numbers", which the
+    # module docstring calls the failure that matters most for an accounting
+    # tool -- and until now nothing failed when it found one. The step was
+    # `continue-on-error`, this function returned 0 unconditionally, and the
+    # results went to a summary. A PR introducing a fresh divergence stayed
+    # green (#2147).
+    #
+    # Gating on ANY divergence is not an option: there is an existing set that
+    # is arguably rustledger being MORE correct, where Python's decimal
+    # context rounds an intermediate at 28 significant digits and we carry the
+    # exact value. Failing on those would just get the gate switched off
+    # again. So this takes the shape the BQL step already uses in this
+    # workflow: a recorded baseline, and only departures from it fail.
+    found = _divergence_keys(divergent, posting_divergent, price_divergent)
+
+    if args.write_baseline:
+        with open(args.write_baseline, "w") as fh:
+            json.dump(sorted(found), fh, indent=2)
+            fh.write("\n")
+        print(f"\nwrote {len(found)} divergence key(s) to {args.write_baseline}")
+        return 0
+
+    if not args.baseline:
+        return 0
+
+    try:
+        with open(args.baseline) as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        print(f"\nERROR: baseline not found: {args.baseline}")
+        return 1
+    except json.JSONDecodeError as exc:
+        # Most likely an unresolved merge conflict: this file is generated, so
+        # two PRs recording divergences will collide in it. A stack trace in a
+        # CI log is a poor way to learn that. Regenerate with --write-baseline.
+        print(f"\nERROR: baseline is not valid JSON: {args.baseline}: {exc}")
+        return 1
+
+    # Shape matters as much as syntax. `tuple("value:x")` is a tuple of
+    # characters, not a key, so a hand-edit that leaves bare strings in the
+    # list would match nothing and report every real divergence as new.
+    if not isinstance(raw, list) or any(
+        not (isinstance(e, (list, tuple)) and len(e) == 2 and all(isinstance(x, str) for x in e))
+        for e in raw
+    ):
+        print(
+            f"\nERROR: baseline must be a list of [file, field] string pairs: {args.baseline}"
+        )
+        return 1
+    known = {tuple(e) for e in raw}
+
+    new = sorted(k for k in found if k not in known)
+    fixed = sorted(k for k in known if k not in found)
+    print("\n=== BASELINE ===")
+    print(f"known {len(known)}, found {len(found)}, "
+          f"new {len(new)}, no-longer-diverging {len(fixed)}")
+    for k in fixed:
+        # Not a failure: a divergence that went away is good news. It is
+        # printed so the baseline can be trimmed rather than silently
+        # accumulating entries that pin nothing.
+        print(f"  RESOLVED (drop from baseline): {k[0]} :: {k[1]}")
+    for k in new:
+        print(f"  NEW DIVERGENCE: {k[0]} :: {k[1]}")
+    if new:
+        print(f"\nERROR: {len(new)} divergence(s) not in the baseline")
+        return 1
     return 0
+
+
+def _divergence_keys(value_div, posting_div, price_div):
+    """Stable (basename, field) keys for every divergence found.
+
+    Basename, not full path: the corpus is fetched to different absolute
+    locations in CI and locally, and a baseline keyed on absolute paths would
+    match nothing. This mirrors how `KNOWN_POSTING_DIVERGENCES` is keyed.
+
+    The key deliberately omits the two values. It pins WHERE we diverge, not
+    by how much, so a known-diverging cell whose numbers get worse still
+    passes. Pinning values was considered and rejected: CI installs beancount
+    from master, so its side of every pair can move without any change here,
+    and a baseline that churns on upstream commits gets regenerated
+    reflexively rather than read. The narrower guarantee -- no divergence in a
+    cell that agreed before -- is the one that survives that.
+
+    Note this is the second layer for the posting axis:
+    `KNOWN_POSTING_DIVERGENCES` already suppresses individually-reasoned
+    fields before they reach `posting_div`, and carries a rationale string per
+    entry. Prefer adding to that dict when a divergence has an explanation
+    worth writing down; this file is the generated catch-all for the value and
+    price axes, which have no such dict.
+    """
+    keys = set()
+    for path, diffs in value_div:
+        for (acct, cur), _x, _y in diffs:
+            keys.add((path.name, f"value:{acct} {cur}"))
+    for axis, div in (("posting", posting_div), ("price", price_div)):
+        for path, diffs in div:
+            for where, _x, _y in diffs:
+                keys.add((path.name, f"{axis}:{where}".rstrip(": ")))
+    return keys
 
 
 if __name__ == "__main__":
