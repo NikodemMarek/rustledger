@@ -420,10 +420,33 @@ impl Executor<'_> {
         table
     }
 
+    /// `"payee | narration"`, or the narration alone when there is no payee.
+    ///
+    /// ONE implementation for the `description` column, which both `#entries`
+    /// and `#postings` expose. It was written out twice, and a divergence in
+    /// the separator or the no-payee case would have shown up as two tables
+    /// describing the same transaction differently.
+    fn transaction_description(txn: &rustledger_core::Transaction) -> String {
+        match &txn.payee {
+            Some(payee) => format!("{payee} | {}", txn.narration),
+            None => txn.narration.to_string(),
+        }
+    }
+
     /// Build the #entries table from all directives.
     ///
-    /// The table has columns: id, type, filename, lineno, date, flag, payee, narration, tags, links, accounts, `_entry_meta`
-    /// This provides access to all directives with source location information.
+    /// Column order matches bean-query's `SELECT * FROM #entries` exactly, so
+    /// the wildcard yields the same 16 columns in the same positions.
+    ///
+    /// Metadata lives in ONE column here, the visible `meta` bean-query
+    /// exposes. This table briefly carried a `_entry_meta` copy of the same
+    /// map as well, which cost a deep clone per entry on every query that
+    /// touched it; `eval_meta_on_table_row` now falls back to `meta` when the
+    /// underscore column is absent, so `ENTRY_META` still resolves.
+    ///
+    /// `#postings` keeps its `_entry_meta`, and must: there `meta` is the
+    /// POSTING's metadata and `_entry_meta` the TRANSACTION's, two different
+    /// maps on one row (#2154).
     pub(super) fn build_entries_table(&self) -> Table {
         let columns = vec![
             "id".to_string(),
@@ -431,13 +454,17 @@ impl Executor<'_> {
             "filename".to_string(),
             "lineno".to_string(),
             "date".to_string(),
+            "year".to_string(),
+            "month".to_string(),
+            "day".to_string(),
             "flag".to_string(),
             "payee".to_string(),
             "narration".to_string(),
+            "description".to_string(),
             "tags".to_string(),
             "links".to_string(),
+            "meta".to_string(),
             "accounts".to_string(),
-            "_entry_meta".to_string(),
         ];
         let mut table = Table::new(columns);
 
@@ -490,7 +517,7 @@ impl Executor<'_> {
             Directive::Custom(c) => Value::Date(c.date),
         };
 
-        let (flag, payee, narration, tags, links, accounts) =
+        let (flag, payee, narration, description, tags, links, accounts) =
             if let Directive::Transaction(txn) = directive {
                 let tags: Vec<String> = txn.tags.iter().map(ToString::to_string).collect();
                 let links: Vec<String> = txn.links.iter().map(ToString::to_string).collect();
@@ -502,18 +529,23 @@ impl Executor<'_> {
                     .into_iter()
                     .collect();
                 accounts.sort(); // Ensure deterministic ordering
+                let description = Self::transaction_description(txn);
                 (
                     Value::String(txn.flag.to_string()),
                     txn.payee
                         .as_ref()
                         .map_or(Value::Null, |p| Value::String(p.to_string())),
                     Value::String(txn.narration.to_string()),
+                    Value::String(description),
                     Value::StringSet(tags),
                     Value::StringSet(links),
                     Value::StringSet(accounts),
                 )
             } else {
+                // bean-query leaves description Null on a non-transaction, the
+                // same as payee and narration.
                 (
+                    Value::Null,
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -526,20 +558,35 @@ impl Executor<'_> {
         let filename = Self::source_filename_value(source_loc);
         let lineno = Self::source_lineno_value(source_loc);
 
+        // Date parts come from the entry's own date, so they are populated for
+        // every directive type and not just transactions -- bean-query reports
+        // `year` on an `open` too.
+        let (year, month, day) = match &date {
+            Value::Date(d) => (
+                Value::Integer(i64::from(d.year())),
+                Value::Integer(i64::from(d.month())),
+                Value::Integer(i64::from(d.day())),
+            ),
+            _ => (Value::Null, Value::Null, Value::Null),
+        };
+
         vec![
             Value::Integer(idx as i64), // id
             Value::String(type_name.to_string()),
             filename,
             lineno,
             date,
+            year,
+            month,
+            day,
             flag,
             payee,
             narration,
+            description,
             tags,
             links,
-            accounts,
-            // Hidden metadata column
             Self::metadata_to_value(directive.meta()),
+            accounts,
         ]
     }
 
@@ -651,10 +698,7 @@ impl Executor<'_> {
                 .collect();
             all_accounts.sort();
 
-            let description = match &txn.payee {
-                Some(payee) => format!("{} | {}", payee, txn.narration),
-                None => txn.narration.to_string(),
-            };
+            let description = Self::transaction_description(txn);
 
             let year = Value::Integer(i64::from(txn.date.year()));
             let month = Value::Integer(i64::from(txn.date.month()));

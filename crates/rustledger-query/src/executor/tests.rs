@@ -2269,3 +2269,180 @@ fn commodity_meta_resolves_under_the_sourced_constructor() {
         Some(&MetaValue::String("US Dollar".to_string())),
     );
 }
+
+/// `SELECT * FROM #entries` must expand to bean-query's 16 columns, in order.
+///
+/// It returned 11 before #2154: `year`, `month`, `day`, `description` and
+/// `meta` were absent, though every one of those names already resolved
+/// against `#postings`. The gap was schema registration, not missing data.
+///
+/// Order is asserted, not just membership, because `SELECT *` is positional
+/// for anyone consuming rows as tuples.
+///
+/// `meta` and `_entry_meta` deliberately carry the same value. The underscore
+/// copy cannot be renamed away: `ENTRY_META` resolves through it, and the
+/// wildcard uses the underscore prefix to hide helper columns. So the pair
+/// has to coexist, and the test pins both halves of that -- the visible one
+/// present in `*`, the hidden one absent from it but still addressable.
+#[test]
+fn entries_table_matches_bean_query_columns() {
+    let directives = vec![
+        Directive::Open(rustledger_core::Open {
+            date: date(2024, 1, 1),
+            account: "Assets:A".into(),
+            currencies: vec![],
+            booking: None,
+            meta: Metadata::default(),
+        }),
+        Directive::Transaction(
+            Transaction::new(date(2024, 2, 15), "monthly invoice")
+                .with_flag('*')
+                .with_payee("Acme Corp")
+                .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(1.00), "USD")))
+                .with_synthesized_posting(Posting::new(
+                    "Equity:O",
+                    Amount::new(dec!(-1.00), "USD"),
+                )),
+        ),
+    ];
+
+    let run = |sql: &str| {
+        let mut executor = Executor::new(&directives);
+        let query = parse(sql).unwrap();
+        executor.execute(&query).unwrap()
+    };
+
+    let starred = run("SELECT * FROM #entries");
+    assert_eq!(
+        starred.columns,
+        vec![
+            "id",
+            "type",
+            "filename",
+            "lineno",
+            "date",
+            "year",
+            "month",
+            "day",
+            "flag",
+            "payee",
+            "narration",
+            "description",
+            "tags",
+            "links",
+            "meta",
+            "accounts",
+        ],
+        "wildcard must match bean-query's #entries columns and their order",
+    );
+    assert!(
+        !starred.columns.iter().any(|c| c == "_entry_meta"),
+        "the helper column must stay out of SELECT * even now that `meta` is visible",
+    );
+
+    // Date parts are populated for EVERY directive, not just transactions:
+    // bean-query reports `year` on an `open` too.
+    let parts = run("SELECT type, year, month, day FROM #entries");
+    assert_eq!(
+        parts.rows[0],
+        vec![
+            Value::String("open".to_string()),
+            Value::Integer(2024),
+            Value::Integer(1),
+            Value::Integer(1),
+        ],
+    );
+
+    // `description` is "payee | narration", and Null where there is no
+    // transaction to describe.
+    let desc = run("SELECT description FROM #entries");
+    assert_eq!(desc.rows[0][0], Value::Null, "an open has no description");
+    assert_eq!(
+        desc.rows[1][0],
+        Value::String("Acme Corp | monthly invoice".to_string()),
+    );
+
+    // `#entries` carries metadata ONCE, under the visible `meta`. It used to
+    // also carry a `_entry_meta` copy; storing the same map twice per row cost
+    // a deep clone on every entry, so `ENTRY_META` now falls back to `meta`
+    // when the helper column is absent. `#postings` is unaffected: it carries
+    // `meta`, `_entry_meta` and `_posting_meta` as three DISTINCT values, so
+    // the fallback is unreachable there.
+    let mut executor = Executor::new(&directives);
+    let query = parse("SELECT _entry_meta FROM #entries").unwrap();
+    assert!(
+        executor.execute(&query).is_err(),
+        "the duplicate helper column should be gone from #entries",
+    );
+
+    // ...and the function that used to read it still resolves, which is the
+    // half that actually matters to a user.
+    assert_eq!(run("SELECT ENTRY_META(\"k\") FROM #entries").rows.len(), 2);
+    assert_eq!(run("SELECT ANY_META(\"k\") FROM #entries").rows.len(), 2);
+}
+
+/// The `#entries` metadata fallback must not disturb `#postings`.
+///
+/// `#entries` carries its metadata once, under the visible `meta`, so
+/// `ENTRY_META` falls back to that column when `_entry_meta` is absent.
+/// `#postings` is the case where that fallback would be actively wrong: there
+/// `meta` is the POSTING's metadata and `_entry_meta` is the TRANSACTION's,
+/// two different maps on the same row. Resolving `ENTRY_META` through `meta`
+/// on that table would silently answer with posting metadata.
+///
+/// Coverage is what prompted this: the branch that takes the helper column
+/// when it IS present was the untested half, which is precisely the half the
+/// safety argument rests on.
+#[test]
+fn entry_meta_fallback_does_not_disturb_postings() {
+    let mut entry_meta: Metadata = Metadata::default();
+    entry_meta.insert(
+        "shared".to_string(),
+        MetaValue::String("from-entry".to_string()),
+    );
+    let mut posting_meta: Metadata = Metadata::default();
+    posting_meta.insert(
+        "shared".to_string(),
+        MetaValue::String("from-posting".to_string()),
+    );
+
+    let mut txn = Transaction::new(date(2024, 2, 15), "t");
+    txn.flag = '*';
+    txn.meta = entry_meta;
+    let mut posting = Posting::new("Assets:A", Amount::new(dec!(1.00), "USD"));
+    posting.meta = posting_meta;
+    let directives = vec![Directive::Transaction(
+        txn.with_synthesized_posting(posting)
+            .with_synthesized_posting(Posting::new("Equity:O", Amount::new(dec!(-1.00), "USD"))),
+    )];
+
+    let run = |sql: &str| {
+        let mut executor = Executor::new(&directives);
+        let query = parse(sql).unwrap();
+        executor.execute(&query).unwrap().rows[0][0].clone()
+    };
+
+    // The key exists at BOTH levels with different values, so an accessor that
+    // reads the wrong column returns the wrong string rather than Null.
+    assert_eq!(
+        run("SELECT ENTRY_META(\"shared\") FROM #postings"),
+        Value::String("from-entry".to_string()),
+        "ENTRY_META on #postings must read the transaction's metadata, not the posting's",
+    );
+    assert_eq!(
+        run("SELECT META(\"shared\") FROM #postings"),
+        Value::String("from-posting".to_string()),
+    );
+    assert_eq!(
+        run("SELECT ANY_META(\"shared\") FROM #postings"),
+        Value::String("from-posting".to_string()),
+        "ANY_META prefers posting metadata when the key is set at both levels",
+    );
+
+    // And on #entries, where only the visible column exists, the fallback is
+    // what makes this resolve at all.
+    assert_eq!(
+        run("SELECT ENTRY_META(\"shared\") FROM #entries"),
+        Value::String("from-entry".to_string()),
+    );
+}
