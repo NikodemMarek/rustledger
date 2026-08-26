@@ -1953,3 +1953,319 @@ fn the_division_operator_matches_bean_query_scale() {
         assert_eq!(n.to_string(), want, "{expr}");
     }
 }
+
+/// The six beanquery functions added in #2153, each pinned against the answer
+/// `bean-query` gives for the same ledger.
+///
+/// They were absent for different reasons and the tests are written to keep
+/// those reasons visible. `HAS_ACCOUNT` existed the whole time as a FROM-clause
+/// predicate and simply was not reachable from a projection, so the interesting
+/// assertion is that both spellings now agree. The other five had no
+/// implementation at all.
+///
+/// `REPR` is deliberately NOT here: beanquery's `repr` returns Python's own
+/// object syntax (`Decimal('10.00')`, `datetime.date(2024, 2, 1)`,
+/// `frozenset({'t1'})`), which describes the `CPython` runtime rather
+/// than the ledger. See the PR for why matching it was rejected.
+#[test]
+fn beanquery_functions_from_issue_2153_match_bean_query() {
+    let mut usd_meta: Metadata = Metadata::default();
+    usd_meta.insert(
+        "name".to_string(),
+        MetaValue::String("US Dollar".to_string()),
+    );
+
+    let directives = vec![
+        Directive::Commodity(rustledger_core::Commodity {
+            date: date(2024, 1, 1),
+            currency: "USD".into(),
+            meta: usd_meta,
+        }),
+        Directive::Transaction(
+            Transaction::new(date(2024, 2, 15), "t")
+                .with_flag('*')
+                .with_tag("t1")
+                .with_tag("zz")
+                .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(10.00), "USD")))
+                .with_synthesized_posting(Posting::new(
+                    "Equity:O",
+                    Amount::new(dec!(-10.00), "USD"),
+                )),
+        ),
+    ];
+
+    // Asserts the value is the same on EVERY row, not just the first. These
+    // functions are evaluated per posting, and the fixture has two, so
+    // checking `rows[0][0]` alone would pass even if the second row
+    // disagreed.
+    let one = |sql: &str| -> Value {
+        let mut executor = Executor::new(&directives);
+        let query = parse(sql).unwrap();
+        let rows = executor.execute(&query).unwrap().rows;
+        assert!(!rows.is_empty(), "query returned no rows: {sql}");
+        let first = rows[0][0].clone();
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row[0], first,
+                "row {index} disagrees with row 0 for `{sql}`; a per-row \
+                 function must answer identically for every posting here",
+            );
+        }
+        first
+    };
+
+    // COMMODITY(amount) -> currency. bean-query: 'USD'
+    assert_eq!(
+        one("SELECT COMMODITY(units(position))"),
+        Value::String("USD".to_string()),
+    );
+
+    // COMMODITY_META / CURRENCY_META read the `commodity` directive, not the
+    // posting. bean-query: 'US Dollar' for both spellings.
+    assert_eq!(
+        one("SELECT COMMODITY_META(\"USD\", \"name\")"),
+        Value::String("US Dollar".to_string()),
+    );
+    assert_eq!(
+        one("SELECT CURRENCY_META(\"USD\", \"name\")"),
+        Value::String("US Dollar".to_string()),
+    );
+    // A currency with no `commodity` directive is Null, not an error.
+    assert_eq!(
+        one("SELECT COMMODITY_META(\"NOPE\", \"name\")"),
+        Value::Null
+    );
+
+    // FINDFIRST(regex, set) -> first match, or Null. bean-query: 'zz' / None.
+    assert_eq!(
+        one("SELECT FINDFIRST(\"z\", tags)"),
+        Value::String("zz".to_string()),
+    );
+    assert_eq!(one("SELECT FINDFIRST(\"nomatch\", tags)"), Value::Null);
+
+    // YEARMONTH truncates to the first of the month and stays a DATE, so it
+    // remains comparable and orderable. bean-query: datetime.date(2024, 2, 1).
+    assert_eq!(one("SELECT YEARMONTH(date)"), Value::Date(date(2024, 2, 1)),);
+
+    // HAS_ACCOUNT asks about the entry, so it must answer identically whether
+    // it is used as a projection or as the FROM predicate it always supported.
+    assert_eq!(one("SELECT HAS_ACCOUNT(\"Assets\")"), Value::Boolean(true));
+    assert_eq!(one("SELECT HAS_ACCOUNT(\"Nope\")"), Value::Boolean(false));
+
+    let from_rows = {
+        let mut executor = Executor::new(&directives);
+        let query = parse("SELECT account FROM has_account(\"Assets\")").unwrap();
+        executor.execute(&query).unwrap().rows.len()
+    };
+    assert_eq!(
+        from_rows, 2,
+        "the FROM predicate must still select the entry the projection reports true for",
+    );
+
+    // `commodity` is typed `commodity(Amount)`. bean-query rejects a position
+    // outright, so accepting one here would be a silent extension -- and the
+    // idiomatic calls both already yield an Amount.
+    let mut executor = Executor::new(&directives);
+    let query = parse("SELECT COMMODITY(position)").unwrap();
+    assert!(
+        executor.execute(&query).is_err(),
+        "COMMODITY(position) must be rejected, as bean-query rejects it",
+    );
+}
+
+/// A currency declared twice resolves to the LAST `commodity` directive.
+///
+/// bean-query answers `'Second'` for the ledger below. Collecting these with
+/// `or_insert_with` keeps the first instead, which is the shape this pins:
+/// the two directives differ only in metadata, so nothing else in the query
+/// output would reveal which one was used.
+#[test]
+fn commodity_meta_takes_the_last_declaration() {
+    let meta_named = |name: &str| {
+        let mut m: Metadata = Metadata::default();
+        m.insert("name".to_string(), MetaValue::String(name.to_string()));
+        m
+    };
+
+    let directives = vec![
+        Directive::Commodity(rustledger_core::Commodity {
+            date: date(2024, 1, 1),
+            currency: "USD".into(),
+            meta: meta_named("First"),
+        }),
+        Directive::Commodity(rustledger_core::Commodity {
+            date: date(2024, 6, 1),
+            currency: "USD".into(),
+            meta: meta_named("Second"),
+        }),
+        Directive::Transaction(
+            Transaction::new(date(2024, 2, 15), "t")
+                .with_flag('*')
+                .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(1.00), "USD")))
+                .with_synthesized_posting(Posting::new(
+                    "Equity:O",
+                    Amount::new(dec!(-1.00), "USD"),
+                )),
+        ),
+    ];
+
+    let mut executor = Executor::new(&directives);
+    let query = parse("SELECT COMMODITY_META(\"USD\", \"name\")").unwrap();
+    assert_eq!(
+        executor.execute(&query).unwrap().rows[0][0],
+        Value::String("Second".to_string()),
+    );
+}
+
+/// Argument guards for the functions added in #2153.
+///
+/// These branches were verified by hand against bean-query while writing the
+/// feature, which is worth exactly nothing once someone refactors the match.
+/// Codecov flagged 36 uncovered lines in `evaluate_function_on_values`, and
+/// almost all of them were these arms.
+///
+/// The Null rows matter as much as the error rows: bean-query answers Null
+/// rather than raising for a Null input, so an arm that errored instead would
+/// turn a query over a ledger with one missing payee into a hard failure.
+#[test]
+fn issue_2153_functions_guard_their_arguments() {
+    let directives = vec![Directive::Transaction(
+        Transaction::new(date(2024, 2, 15), "t")
+            .with_flag('*')
+            .with_tag("t1")
+            .with_synthesized_posting(Posting::new("Assets:A", Amount::new(dec!(1.00), "USD")))
+            .with_synthesized_posting(Posting::new("Equity:O", Amount::new(dec!(-1.00), "USD"))),
+    )];
+
+    let run = |sql: &str| {
+        let mut executor = Executor::new(&directives);
+        let query = parse(sql).unwrap();
+        executor.execute(&query).map(|r| r.rows[0][0].clone())
+    };
+
+    // Wrong arity is an error, not a silent Null.
+    for sql in [
+        "SELECT COMMODITY_META()",
+        "SELECT COMMODITY_META(\"USD\", \"a\", \"b\")",
+        "SELECT FINDFIRST(\"x\")",
+        "SELECT YEARMONTH(date, date)",
+        "SELECT COMMODITY(units(position), units(position))",
+    ] {
+        assert!(run(sql).is_err(), "expected an arity error from `{sql}`");
+    }
+
+    // Wrong types are errors too, and each names the function so the message
+    // is actionable rather than a bare "type error".
+    for sql in [
+        "SELECT COMMODITY(1)",
+        "SELECT COMMODITY_META(1, 2)",
+        "SELECT FINDFIRST(1, tags)",
+        "SELECT YEARMONTH(\"notadate\")",
+    ] {
+        assert!(run(sql).is_err(), "expected a type error from `{sql}`");
+    }
+
+    // An invalid regex is reported rather than treated as "matches nothing",
+    // which would silently answer false/Null for a typo'd pattern.
+    assert!(run("SELECT FINDFIRST(\"[\", tags)").is_err());
+    assert!(run("SELECT HAS_ACCOUNT(\"[\")").is_err());
+
+    // Null in, Null out, matching bean-query. `payee` is Null on this
+    // transaction, so these are the real shapes a ledger produces.
+    for sql in [
+        "SELECT COMMODITY_META(payee, \"name\")",
+        "SELECT COMMODITY_META(\"USD\", payee)",
+        "SELECT FINDFIRST(payee, tags)",
+        "SELECT HAS_ACCOUNT(payee)",
+    ] {
+        assert_eq!(run(sql).unwrap(), Value::Null, "expected Null from `{sql}`");
+    }
+
+    // A currency with no `commodity` directive is Null in both the
+    // one-argument and two-argument forms.
+    assert_eq!(run("SELECT COMMODITY_META(\"USD\")").unwrap(), Value::Null);
+    assert_eq!(
+        run("SELECT COMMODITY_META(\"USD\", \"name\")").unwrap(),
+        Value::Null,
+    );
+}
+
+/// `COMMODITY_META` must work under `new_with_sources`, not just `new`.
+///
+/// The two constructors each build their own directive caches, so a lookup
+/// added to one and not the other fails only on the path that constructor
+/// serves. `new_with_sources` is the CLI and LSP path, which is where a user
+/// would actually hit this, and it is invisible to a test that only ever
+/// calls `Executor::new`.
+///
+/// Coverage said so plainly: the `Directive::Commodity` arm in this
+/// constructor was the one block of #2153's change with no test reaching it,
+/// even though the commit that added it claimed updating both constructors
+/// mattered.
+///
+/// This also covers the one-argument form returning a real metadata map
+/// rather than Null, which the other tests only exercise on the missing-
+/// currency path.
+#[test]
+fn commodity_meta_resolves_under_the_sourced_constructor() {
+    use rustledger_loader::SourceMap;
+
+    let mut source_map = SourceMap::new();
+    let source: std::sync::Arc<str> = "2024-01-01 commodity USD\n  name: \"US Dollar\"\n".into();
+    let file_id = source_map.add_file("test.beancount".into(), source);
+
+    let mut usd_meta: Metadata = Metadata::default();
+    usd_meta.insert(
+        "name".to_string(),
+        MetaValue::String("US Dollar".to_string()),
+    );
+
+    let spanned_directives = vec![
+        Spanned {
+            value: Directive::Commodity(rustledger_core::Commodity {
+                date: date(2024, 1, 1),
+                currency: "USD".into(),
+                meta: usd_meta,
+            }),
+            span: rustledger_parser::Span { start: 0, end: 40 },
+            file_id: file_id as u16,
+        },
+        Spanned {
+            value: Directive::Transaction(
+                Transaction::new(date(2024, 2, 15), "t")
+                    .with_flag('*')
+                    .with_synthesized_posting(Posting::new(
+                        "Assets:A",
+                        Amount::new(dec!(1.00), "USD"),
+                    ))
+                    .with_synthesized_posting(Posting::new(
+                        "Equity:O",
+                        Amount::new(dec!(-1.00), "USD"),
+                    )),
+            ),
+            span: rustledger_parser::Span { start: 40, end: 90 },
+            file_id: file_id as u16,
+        },
+    ];
+
+    let run = |sql: &str| {
+        let mut executor = Executor::new_with_sources(&spanned_directives, &source_map);
+        let query = parse(sql).unwrap();
+        executor.execute(&query).unwrap().rows[0][0].clone()
+    };
+
+    assert_eq!(
+        run("SELECT COMMODITY_META(\"USD\", \"name\")"),
+        Value::String("US Dollar".to_string()),
+        "the sourced constructor must resolve commodity metadata too",
+    );
+
+    // One-argument form: the whole map, not Null, and carrying the key.
+    let Value::Metadata(meta) = run("SELECT COMMODITY_META(\"USD\")") else {
+        panic!("expected a metadata map from the one-argument form");
+    };
+    assert_eq!(
+        meta.get("name"),
+        Some(&MetaValue::String("US Dollar".to_string())),
+    );
+}

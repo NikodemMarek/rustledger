@@ -127,6 +127,10 @@ pub struct Executor<'a> {
     regex_cache: RwLock<FxHashMap<String, Option<Arc<Regex>>>>,
     /// Account info cache from Open/Close directives.
     account_info: FxHashMap<String, AccountInfo>,
+    /// Metadata of each `commodity` directive, keyed by currency.
+    /// Backs `COMMODITY_META` / `CURRENCY_META`, which beanquery answers from
+    /// the commodity directive rather than from any posting (#2153).
+    commodity_meta: FxHashMap<String, rustledger_core::Metadata>,
     /// Source locations for directives (indexed by directive index).
     source_locations: Option<Vec<SourceLocation>>,
     /// The source map, kept so per-posting source locations (the `lineno` /
@@ -168,6 +172,7 @@ impl<'a> Executor<'a> {
 
         // Build account info cache from Open/Close directives
         let mut account_info: FxHashMap<String, AccountInfo> = FxHashMap::default();
+        let mut commodity_meta: FxHashMap<String, rustledger_core::Metadata> = FxHashMap::default();
         for directive in directives {
             match directive {
                 Directive::Open(open) => {
@@ -182,6 +187,13 @@ impl<'a> Executor<'a> {
                     let info = account_info.entry(account).or_default();
                     info.close_date = Some(close.date);
                 }
+                Directive::Commodity(commodity) => {
+                    // Last declaration wins, matching bean-query: a ledger
+                    // that declares `commodity USD` twice resolves to the
+                    // later directive's metadata. `or_insert_with` here kept
+                    // the FIRST and disagreed.
+                    commodity_meta.insert(commodity.currency.to_string(), commodity.meta.clone());
+                }
                 _ => {}
             }
         }
@@ -195,6 +207,7 @@ impl<'a> Executor<'a> {
             account_types: rustledger_core::AccountTypes::default(),
             regex_cache: RwLock::new(FxHashMap::default()),
             account_info,
+            commodity_meta,
             source_locations: None,
             source_map: None,
             tables: FxHashMap::default(),
@@ -253,6 +266,7 @@ impl<'a> Executor<'a> {
 
         // Build account info cache from Open/Close directives
         let mut account_info: FxHashMap<String, AccountInfo> = FxHashMap::default();
+        let mut commodity_meta: FxHashMap<String, rustledger_core::Metadata> = FxHashMap::default();
         for spanned in spanned_directives {
             match &spanned.value {
                 Directive::Open(open) => {
@@ -267,6 +281,13 @@ impl<'a> Executor<'a> {
                     let info = account_info.entry(account).or_default();
                     info.close_date = Some(close.date);
                 }
+                Directive::Commodity(commodity) => {
+                    // Last declaration wins, matching bean-query: a ledger
+                    // that declares `commodity USD` twice resolves to the
+                    // later directive's metadata. `or_insert_with` here kept
+                    // the FIRST and disagreed.
+                    commodity_meta.insert(commodity.currency.to_string(), commodity.meta.clone());
+                }
                 _ => {}
             }
         }
@@ -280,6 +301,7 @@ impl<'a> Executor<'a> {
             account_types: rustledger_core::AccountTypes::default(),
             regex_cache: RwLock::new(FxHashMap::default()),
             account_info,
+            commodity_meta,
             source_locations: Some(source_locations),
             source_map: Some(source_map),
             tables: FxHashMap::default(),
@@ -388,6 +410,22 @@ impl<'a> Executor<'a> {
     }
 
     /// Get or compile a regex pattern, returning an error if invalid.
+    /// Does any posting on this entry have an account matching `pattern`?
+    ///
+    /// ONE implementation for both spellings of `HAS_ACCOUNT`: the FROM
+    /// predicate in `evaluate_from_filter` and the projection arm in
+    /// `evaluate_function`. They answer the same question about the same
+    /// entry, so a second copy is a divergence waiting to happen -- the
+    /// two already differed in their error text before this was extracted.
+    fn entry_has_account(
+        &self,
+        txn: &rustledger_core::Transaction,
+        pattern: &str,
+    ) -> Result<bool, QueryError> {
+        let regex = self.require_regex(pattern)?;
+        Ok(txn.postings.iter().any(|p| regex.is_match(&p.account)))
+    }
+
     fn require_regex(&self, pattern: &str) -> Result<Arc<Regex>, QueryError> {
         self.get_or_compile_regex(pattern)
             .ok_or_else(|| QueryError::Type(format!("invalid regex: {pattern}")))
@@ -817,6 +855,35 @@ impl<'a> Executor<'a> {
             "WEIGHT" if Self::is_position_column(func) => Ok(compute_posting_weight(
                 &ctx.transaction.postings[ctx.posting_index],
             )),
+            // `HAS_ACCOUNT(regex)` asks about the whole ENTRY, so like the META
+            // family it needs the row's transaction rather than the evaluated
+            // argument list. It was already implemented for the FROM clause in
+            // `evaluate_from_filter`; without this arm the same name resolved
+            // there and raised `UnknownFunction` in a projection (#2153).
+            "HAS_ACCOUNT" => {
+                let args = func
+                    .args
+                    .iter()
+                    .map(|a| self.evaluate_expr(a, ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if args.len() != 1 {
+                    return Err(QueryError::InvalidArguments(
+                        "HAS_ACCOUNT".to_string(),
+                        "expected 1 argument".to_string(),
+                    ));
+                }
+                let Value::String(pattern) = &args[0] else {
+                    return match &args[0] {
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(QueryError::Type(
+                            "HAS_ACCOUNT expects a string pattern".to_string(),
+                        )),
+                    };
+                };
+                Ok(Value::Boolean(
+                    self.entry_has_account(ctx.transaction, pattern)?,
+                ))
+            }
             // Aggregates evaluate to Null per row; real aggregation happens in
             // the aggregation pass.
             "SUM" | "COUNT" | "MIN" | "MAX" | "FIRST" | "LAST" | "AVG" => Ok(Value::Null),
@@ -1945,6 +2012,97 @@ impl<'a> Executor<'a> {
                     _ => Err(QueryError::Type(format!(
                         "{name_upper}: argument must be a string key"
                     ))),
+                }
+            }
+            // The currency of an amount. bean-query types this strictly as
+            // `commodity(Amount) -> str` and rejects a position, so
+            // `commodity(position)` is an error on both sides; the idiomatic
+            // spellings are `commodity(units(position))` and
+            // `commodity(cost(position))`, both of which yield an Amount.
+            "COMMODITY" => {
+                Self::require_args_count(&name_upper, args, 1)?;
+                match &args[0] {
+                    Value::Amount(amount) => Ok(Value::String(amount.currency.to_string())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(QueryError::Type("COMMODITY expects an amount".to_string())),
+                }
+            }
+            // `CURRENCY_META` is beanquery's own alias for `COMMODITY_META`;
+            // both resolve against the `commodity` directive. One argument
+            // returns the whole metadata map, two return a single key, so a
+            // ledger with no matching directive yields Null either way.
+            "COMMODITY_META" | "CURRENCY_META" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(QueryError::InvalidArguments(
+                        name_upper.clone(),
+                        "expected 1 or 2 arguments".to_string(),
+                    ));
+                }
+                let Value::String(currency) = &args[0] else {
+                    return match &args[0] {
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(QueryError::Type(format!(
+                            "{name_upper} expects a currency string"
+                        ))),
+                    };
+                };
+                let Some(meta) = self.commodity_meta.get(currency.as_str()) else {
+                    return Ok(Value::Null);
+                };
+                if args.len() == 1 {
+                    return Ok(Value::Metadata(Box::new(meta.clone())));
+                }
+                match &args[1] {
+                    Value::String(key) => Ok(Self::meta_value_to_value(meta.get(key.as_str()))),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(QueryError::Type(format!(
+                        "{name_upper}: key must be a string"
+                    ))),
+                }
+            }
+            // First element of a string set matching a regex. The set is
+            // scanned in its stored order, which for `tags`/`links` is the
+            // order the directive declares them, so the answer is stable
+            // rather than dependent on set iteration.
+            "FINDFIRST" => {
+                Self::require_args_count(&name_upper, args, 2)?;
+                let (Value::String(pattern), haystack) = (&args[0], &args[1]) else {
+                    return match (&args[0], &args[1]) {
+                        (Value::Null, _) => Ok(Value::Null),
+                        _ => Err(QueryError::Type(
+                            "FINDFIRST expects (regex_string, string_set)".to_string(),
+                        )),
+                    };
+                };
+                // Borrowed scan: only the matching element is cloned, so a hit
+                // on the first tag does not copy the whole set.
+                let candidates: &[String] = match haystack {
+                    Value::StringSet(items) => items,
+                    Value::String(single) => std::slice::from_ref(single),
+                    Value::Null => return Ok(Value::Null),
+                    _ => {
+                        return Err(QueryError::Type(
+                            "FINDFIRST expects a string set as its second argument".to_string(),
+                        ));
+                    }
+                };
+                let regex = self.require_regex(pattern)?;
+                Ok(candidates
+                    .iter()
+                    .find(|c| regex.is_match(c))
+                    .map_or(Value::Null, |c| Value::String(c.clone())))
+            }
+            // Truncate a date to the first of its month. beanquery returns a
+            // date here, not a string, so `yearmonth(date)` stays orderable
+            // and comparable against other dates.
+            "YEARMONTH" => {
+                Self::require_args_count(&name_upper, args, 1)?;
+                match &args[0] {
+                    Value::Date(date) => Ok(Value::Date(
+                        rustledger_core::CalendarPeriod::Month.start_of(*date),
+                    )),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(QueryError::Type("YEARMONTH expects a date".to_string())),
                 }
             }
             // Aggregate functions return Null when evaluated on a single row
