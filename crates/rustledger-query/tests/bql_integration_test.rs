@@ -6449,7 +6449,7 @@ fn test_balances_table_case_insensitive() {
 
 #[test]
 fn test_balances_table_deterministic_ordering() {
-    // Test: Multiple balances on the same date should have deterministic order by account
+    // Test: Multiple balances on the same date keep their source order
     let directives = vec![
         Directive::Balance(Balance::new(
             date(2024, 1, 1),
@@ -6469,14 +6469,18 @@ fn test_balances_table_deterministic_ordering() {
     ];
     let result = execute_query("SELECT account FROM #balances", &directives);
 
-    // Should be sorted by (date, account), so Apple, Banana, Zebra
+    // Declaration order, NOT alphabetical. beancount orders entries by
+    // (date, lineno), so bean-query returns rows sharing a date in the order
+    // they were written; sorting by account reordered them (#2163). The
+    // guarantee is still determinism -- `sort_by` is stable and the directive
+    // stream is source-ordered -- just anchored to the source, not the name.
     assert_eq!(result.len(), 3);
-    assert_eq!(result.rows[0][0], Value::String("Assets:Apple".to_string()));
+    assert_eq!(result.rows[0][0], Value::String("Assets:Zebra".to_string()));
+    assert_eq!(result.rows[1][0], Value::String("Assets:Apple".to_string()));
     assert_eq!(
-        result.rows[1][0],
+        result.rows[2][0],
         Value::String("Assets:Banana".to_string())
     );
-    assert_eq!(result.rows[2][0], Value::String("Assets:Zebra".to_string()));
 }
 
 // ============================================================================
@@ -6560,6 +6564,133 @@ fn make_all_directive_types_test_directives() -> Vec<Directive> {
             Amount::new(dec!(0.00), "USD"),
         )),
     ]
+}
+
+#[test]
+fn system_tables_sort_unordered_directives_by_date() {
+    // The date sort is a no-op on the loader path, which already hands over
+    // directives in beancount's (date, SORT_ORDER, lineno) order -- `#entries`
+    // never sorts and still comes back date-ordered. It matters only when an
+    // `Executor` is built directly from a caller-supplied slice, as these
+    // tests do, where nothing has ordered anything.
+    //
+    // Without this, removing the sort entirely passed the whole suite (#2165
+    // review), leaving the one path it exists for untested.
+    let directives = vec![
+        Directive::Open(Open::new(date(2024, 1, 1), "Assets:Cash")),
+        Directive::Note(Note::new(date(2024, 9, 1), "Assets:Cash", "september")),
+        Directive::Note(Note::new(date(2024, 3, 1), "Assets:Cash", "march")),
+        Directive::Note(Note::new(date(2024, 6, 1), "Assets:Cash", "june")),
+        Directive::Commodity(Commodity::new(date(2024, 9, 2), "ZZZ")),
+        Directive::Commodity(Commodity::new(date(2024, 3, 2), "AAA")),
+        Directive::Event(Event::new(date(2024, 9, 3), "z", "z")),
+        Directive::Event(Event::new(date(2024, 3, 3), "a", "a")),
+        Directive::Document(Document::new(date(2024, 9, 4), "Assets:Cash", "/z.pdf")),
+        Directive::Document(Document::new(date(2024, 3, 4), "Assets:Cash", "/a.pdf")),
+        Directive::Balance(Balance::new(
+            date(2024, 9, 5),
+            "Assets:Zebra",
+            Amount::new(dec!(0.00), "USD"),
+        )),
+        Directive::Balance(Balance::new(
+            date(2024, 3, 5),
+            "Assets:Alpha",
+            Amount::new(dec!(0.00), "USD"),
+        )),
+    ];
+
+    // All five tables, so that deleting any one table's sort is caught. An
+    // earlier version of this test covered only three, and removing the
+    // #balances or #documents sort still passed the whole suite.
+    for (query, expected) in [
+        (
+            "SELECT comment FROM #notes",
+            vec!["march", "june", "september"],
+        ),
+        ("SELECT name FROM #commodities", vec!["AAA", "ZZZ"]),
+        ("SELECT type FROM #events", vec!["a", "z"]),
+        ("SELECT filename FROM #documents", vec!["/a.pdf", "/z.pdf"]),
+        (
+            "SELECT account FROM #balances",
+            vec!["Assets:Alpha", "Assets:Zebra"],
+        ),
+    ] {
+        let result = execute_query(query, &directives);
+        let got: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::String(v) => v.clone(),
+                other => panic!("{query} returned a non-string: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got, expected,
+            "{query} did not sort unordered input by date"
+        );
+    }
+}
+
+#[test]
+fn system_tables_preserve_source_order_within_a_date() {
+    // beancount orders entries by (date, lineno), so bean-query returns rows
+    // sharing a date in the order they were written. Each pair below is
+    // declared Zebra-then-Alpha so a secondary sort on account/type/name --
+    // which is what these tables used to do -- would visibly reverse it
+    // (#2163).
+    //
+    // #prices is deliberately absent: its rows come from an FxHashMap keyed
+    // by base currency, carry no source position, and are ordered by the
+    // secondary key on purpose. Asserting source order there would be
+    // asserting hash iteration order.
+    let directives = vec![
+        Directive::Open(Open::new(date(2024, 1, 1), "Assets:Zebra")),
+        Directive::Open(Open::new(date(2024, 1, 1), "Assets:Alpha")),
+        Directive::Commodity(Commodity::new(date(2024, 1, 2), "ZZZ")),
+        Directive::Commodity(Commodity::new(date(2024, 1, 2), "AAA")),
+        Directive::Note(Note::new(date(2024, 1, 3), "Assets:Zebra", "z")),
+        Directive::Note(Note::new(date(2024, 1, 3), "Assets:Alpha", "a")),
+        Directive::Event(Event::new(date(2024, 1, 4), "zeta", "z")),
+        Directive::Event(Event::new(date(2024, 1, 4), "alpha", "a")),
+        Directive::Document(Document::new(date(2024, 1, 5), "Assets:Zebra", "/z.pdf")),
+        Directive::Document(Document::new(date(2024, 1, 5), "Assets:Alpha", "/a.pdf")),
+        Directive::Balance(Balance::new(
+            date(2024, 1, 6),
+            "Assets:Zebra",
+            Amount::new(dec!(0.00), "USD"),
+        )),
+        Directive::Balance(Balance::new(
+            date(2024, 1, 6),
+            "Assets:Alpha",
+            Amount::new(dec!(0.00), "USD"),
+        )),
+    ];
+
+    for (query, first, second) in [
+        ("SELECT name FROM #commodities", "ZZZ", "AAA"),
+        ("SELECT account FROM #notes", "Assets:Zebra", "Assets:Alpha"),
+        ("SELECT type FROM #events", "zeta", "alpha"),
+        ("SELECT filename FROM #documents", "/z.pdf", "/a.pdf"),
+        (
+            "SELECT account FROM #balances",
+            "Assets:Zebra",
+            "Assets:Alpha",
+        ),
+    ] {
+        let result = execute_query(query, &directives);
+        assert_eq!(result.len(), 2, "{query} did not return both rows");
+        assert_eq!(
+            result.rows[0][0],
+            Value::String(first.to_string()),
+            "{query} lost source order (got {:?} first)",
+            result.rows[0][0]
+        );
+        assert_eq!(
+            result.rows[1][0],
+            Value::String(second.to_string()),
+            "{query} lost source order"
+        );
+    }
 }
 
 #[test]
@@ -6675,10 +6806,10 @@ fn test_commodities_table_deterministic_ordering() {
     ];
     let result = execute_query("SELECT name FROM #commodities", &directives);
 
-    // Should be sorted by (date, name)
-    assert_eq!(result.rows[0][0], Value::String("AAA".to_string()));
-    assert_eq!(result.rows[1][0], Value::String("MMM".to_string()));
-    assert_eq!(result.rows[2][0], Value::String("ZZZ".to_string()));
+    // Declaration order, not alphabetical -- see the #balances case above.
+    assert_eq!(result.rows[0][0], Value::String("ZZZ".to_string()));
+    assert_eq!(result.rows[1][0], Value::String("AAA".to_string()));
+    assert_eq!(result.rows[2][0], Value::String("MMM".to_string()));
 }
 
 // ============================================================================

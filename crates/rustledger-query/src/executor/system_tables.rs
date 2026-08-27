@@ -38,7 +38,13 @@ impl Executor<'_> {
         // lookups but hidden from the `#prices` table for bean-query
         // compat.
         let mut entries: Vec<_> = self.price_db.iter_explicit_entries().collect();
-        // Sort by (date, base_currency) for consistent, deterministic output
+        // Sort by (date, base_currency). NOT source order, unlike the other
+        // system tables: these rows come from `price_db`, whose outer map is
+        // an `FxHashMap` keyed by base currency, so iteration is grouped by
+        // currency in arbitrary order and no source position survives. The
+        // secondary key is what makes this table deterministic at all
+        // — dropping it to chase bean-query's source order would trade a wrong
+        // but stable order for an unstable one (#2163).
         entries.sort_by(|(currency_a, date_a, _, _), (currency_b, date_b, _, _)| {
             date_a.cmp(date_b).then_with(|| currency_a.cmp(currency_b))
         });
@@ -95,10 +101,24 @@ impl Executor<'_> {
             })
             .collect();
 
-        // Sort by (date, account) for consistent, deterministic output
-        balances.sort_by(|(date_a, account_a, ..), (date_b, account_b, ..)| {
-            date_a.cmp(date_b).then_with(|| account_a.cmp(account_b))
-        });
+        // Sort by date ONLY, and stably. The loader already hands over
+        // directives in beancount's (date, SORT_ORDER, lineno) order -- which
+        // is why `#entries`, which never sorts, still comes back ordered -- so
+        // on that path this is a no-op that must not disturb what it receives.
+        // It does real work only when an `Executor` is built directly from a
+        // caller-supplied slice, where nothing has ordered anything.
+        //
+        // The bug was therefore not a missing sort but an extra one: a
+        // secondary key on account/type/name re-ordered rows that already
+        // shared a date, away from the order bean-query returns (#2163).
+        //
+        // This matches beancount's `(date, lineno)` within a single file. It
+        // deliberately does NOT match across an `include`. beancount compares
+        // the raw line number with no record of which file it came from, so
+        // adding two comment lines to an included file reorders query results;
+        // measured, not assumed (#2166). We keep each file's directives
+        // together, which is stable under that edit. Divergence by choice.
+        balances.sort_by_key(|(date, ..)| *date);
 
         for (date, account, amount, tolerance, meta) in balances {
             let row = vec![
@@ -141,10 +161,24 @@ impl Executor<'_> {
             })
             .collect();
 
-        // Sort by (date, name) for consistent output
-        commodities.sort_by(|(date_a, name_a, _), (date_b, name_b, _)| {
-            date_a.cmp(date_b).then_with(|| name_a.cmp(name_b))
-        });
+        // Sort by date ONLY, and stably. The loader already hands over
+        // directives in beancount's (date, SORT_ORDER, lineno) order -- which
+        // is why `#entries`, which never sorts, still comes back ordered -- so
+        // on that path this is a no-op that must not disturb what it receives.
+        // It does real work only when an `Executor` is built directly from a
+        // caller-supplied slice, where nothing has ordered anything.
+        //
+        // The bug was therefore not a missing sort but an extra one: a
+        // secondary key on account/type/name re-ordered rows that already
+        // shared a date, away from the order bean-query returns (#2163).
+        //
+        // This matches beancount's `(date, lineno)` within a single file. It
+        // deliberately does NOT match across an `include`. beancount compares
+        // the raw line number with no record of which file it came from, so
+        // adding two comment lines to an included file reorders query results;
+        // measured, not assumed (#2166). We keep each file's directives
+        // together, which is stable under that edit. Divergence by choice.
+        commodities.sort_by_key(|(date, ..)| *date);
 
         for (date, name, meta) in commodities {
             let row = vec![
@@ -186,10 +220,24 @@ impl Executor<'_> {
             })
             .collect();
 
-        // Sort by (date, type) for consistent output
-        events.sort_by(|(date_a, type_a, ..), (date_b, type_b, ..)| {
-            date_a.cmp(date_b).then_with(|| type_a.cmp(type_b))
-        });
+        // Sort by date ONLY, and stably. The loader already hands over
+        // directives in beancount's (date, SORT_ORDER, lineno) order -- which
+        // is why `#entries`, which never sorts, still comes back ordered -- so
+        // on that path this is a no-op that must not disturb what it receives.
+        // It does real work only when an `Executor` is built directly from a
+        // caller-supplied slice, where nothing has ordered anything.
+        //
+        // The bug was therefore not a missing sort but an extra one: a
+        // secondary key on account/type/name re-ordered rows that already
+        // shared a date, away from the order bean-query returns (#2163).
+        //
+        // This matches beancount's `(date, lineno)` within a single file. It
+        // deliberately does NOT match across an `include`. beancount compares
+        // the raw line number with no record of which file it came from, so
+        // adding two comment lines to an included file reorders query results;
+        // measured, not assumed (#2166). We keep each file's directives
+        // together, which is stable under that edit. Divergence by choice.
+        events.sort_by_key(|(date, ..)| *date);
 
         for (date, event_type, description, meta) in events {
             let row = vec![
@@ -237,10 +285,24 @@ impl Executor<'_> {
             })
             .collect();
 
-        // Sort by (date, account) for consistent output
-        notes.sort_by(|(date_a, account_a, ..), (date_b, account_b, ..)| {
-            date_a.cmp(date_b).then_with(|| account_a.cmp(account_b))
-        });
+        // Sort by date ONLY, and stably. The loader already hands over
+        // directives in beancount's (date, SORT_ORDER, lineno) order -- which
+        // is why `#entries`, which never sorts, still comes back ordered -- so
+        // on that path this is a no-op that must not disturb what it receives.
+        // It does real work only when an `Executor` is built directly from a
+        // caller-supplied slice, where nothing has ordered anything.
+        //
+        // The bug was therefore not a missing sort but an extra one: a
+        // secondary key on account/type/name re-ordered rows that already
+        // shared a date, away from the order bean-query returns (#2163).
+        //
+        // This matches beancount's `(date, lineno)` within a single file. It
+        // deliberately does NOT match across an `include`. beancount compares
+        // the raw line number with no record of which file it came from, so
+        // adding two comment lines to an included file reorders query results;
+        // measured, not assumed (#2166). We keep each file's directives
+        // together, which is stable under that edit. Divergence by choice.
+        notes.sort_by_key(|(date, ..)| *date);
 
         for (date, account, comment, meta) in notes {
             let row = vec![
@@ -294,15 +356,24 @@ impl Executor<'_> {
             })
             .collect();
 
-        // Sort by (date, account, filename) for consistent output
-        documents.sort_by(
-            |(date_a, account_a, file_a, ..), (date_b, account_b, file_b, ..)| {
-                date_a
-                    .cmp(date_b)
-                    .then_with(|| account_a.cmp(account_b))
-                    .then_with(|| file_a.cmp(file_b))
-            },
-        );
+        // Sort by date ONLY, and stably. The loader already hands over
+        // directives in beancount's (date, SORT_ORDER, lineno) order -- which
+        // is why `#entries`, which never sorts, still comes back ordered -- so
+        // on that path this is a no-op that must not disturb what it receives.
+        // It does real work only when an `Executor` is built directly from a
+        // caller-supplied slice, where nothing has ordered anything.
+        //
+        // The bug was therefore not a missing sort but an extra one: a
+        // secondary key on account/type/name re-ordered rows that already
+        // shared a date, away from the order bean-query returns (#2163).
+        //
+        // This matches beancount's `(date, lineno)` within a single file. It
+        // deliberately does NOT match across an `include`. beancount compares
+        // the raw line number with no record of which file it came from, so
+        // adding two comment lines to an included file reorders query results;
+        // measured, not assumed (#2166). We keep each file's directives
+        // together, which is stable under that edit. Divergence by choice.
+        documents.sort_by_key(|(date, ..)| *date);
 
         for (date, account, filename, tags, links, meta) in documents {
             let tags_vec: Vec<String> = tags.iter().map(ToString::to_string).collect();
