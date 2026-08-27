@@ -40,6 +40,58 @@ const KNOWN_OPTIONS: &[&str] = &[
     "tolerance_multiplier", // Renamed from inferred_tolerance_multiplier
 ];
 
+/// The E7004 message for a deprecated option, if it is one.
+///
+/// One table rather than three inline strings: the include-scope check has to
+/// report deprecation as well, and a second copy of these messages would drift
+/// from the arms that raise them.
+fn deprecation_message(key: &str) -> Option<&'static str> {
+    match key {
+        "inferred_tolerance_multiplier" => Some("Renamed to 'tolerance_multiplier'."),
+        "allow_pipe_separator" => Some("Option 'allow_pipe_separator' is deprecated"),
+        "plugin" => Some("Option 'plugin' is deprecated; use the 'plugin' directive instead"),
+        _ => None,
+    }
+}
+
+/// Options that survive an `include` boundary.
+///
+/// Everything else is taken from the TOP-LEVEL file only. The split is by what
+/// an option governs, not by one blanket rule (#2151):
+///
+/// * These describe the file that declares them. A sub-ledger naming its own
+///   operating currency or document root is describing itself, not overriding
+///   its includer, so they accumulate.
+/// * Everything else defines global computation or the ledger's identity.
+///   `booking_method` decides which lot a sale consumes and
+///   `inferred_tolerance_default` decides what counts as balanced, so letting
+///   an included file set them means a sub-ledger silently changes results for
+///   every other entity in the tree — including the master's own transactions.
+///
+/// Note this is NOT the same list as [`REPEATABLE_OPTIONS`]. Repeating within
+/// one file and carrying across an include are different properties:
+/// `inferred_tolerance_default` accumulates within a file and must still not
+/// cross an include, which is exactly the combination that let an unbalanced
+/// transaction pass.
+///
+/// Plugins are absent for a reason that needs the two spellings kept apart.
+/// The `plugin "name"` DIRECTIVE never reaches this function: it is collected
+/// separately and already accumulates from any file, which is deliberate.
+/// bean-query discards plugins declared in included files, leaving the user
+/// with errors about accounts a plugin they did declare would have opened.
+///
+/// The deprecated `option "plugin"` form is a different thing and IS a known
+/// option, so it does route through here and is scoped out like the rest.
+/// That is why the include-scope branch re-raises E7004: the option was
+/// already an error before this list existed, and being ignored must not
+/// quietly downgrade it.
+const ACCUMULATE_ACROSS_INCLUDES: &[&str] = &[
+    "operating_currency",
+    "documents",
+    "insert_pythonpath",
+    "display_precision",
+];
+
 /// Options that can be specified multiple times.
 const REPEATABLE_OPTIONS: &[&str] = &[
     "operating_currency",
@@ -222,6 +274,60 @@ impl Options {
     ///
     /// Validates the option and collects any warnings in `self.warnings`.
     pub fn set(&mut self, key: &str, value: &str) {
+        self.set_scoped(key, value, true);
+    }
+
+    /// Raise E7004 if `key` is deprecated.
+    ///
+    /// The three arms that handle deprecated options and the include-scope
+    /// branch all need this, and all four previously spelled it out. Reaching
+    /// for `deprecation_message(key).unwrap_or_default()` in the arms was the
+    /// worst of those: an entry dropped from the table would have produced an
+    /// E7004 with an EMPTY message rather than any visible failure.
+    fn warn_if_deprecated(&mut self, key: &str, value: &str) {
+        let Some(message) = deprecation_message(key) else {
+            return;
+        };
+        self.warnings.push(OptionWarning {
+            code: "E7004",
+            message: message.to_string(),
+            option: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+
+    /// Apply an option, knowing whether it came from the top-level file.
+    ///
+    /// See the `ACCUMULATE_ACROSS_INCLUDES` list. An option outside it, seen in
+    /// an INCLUDED file, is reported and dropped rather than applied: the
+    /// top-level file's value governs, so an included sub-ledger cannot change
+    /// how the whole tree books or balances.
+    pub fn set_scoped(&mut self, key: &str, value: &str, top_level: bool) {
+        if !top_level && KNOWN_OPTIONS.contains(&key) && !ACCUMULATE_ACROSS_INCLUDES.contains(&key)
+        {
+            // A deprecated option is still deprecated when it is also ignored,
+            // and E7004 is an error where the notice below is a warning. Raise
+            // it first so scoping cannot quietly downgrade the severity of a
+            // diagnostic that existed before this check did.
+            self.warn_if_deprecated(key, value);
+            // Its own code, not E7003. That one means "specified twice, last
+            // wins" and is mapped downstream to `ErrorCode::DuplicateOption`;
+            // this option may be the only one of its name in the tree.
+            self.warnings.push(OptionWarning {
+                code: "E7009",
+                message: format!(
+                    "Option \"{key}\" set in an included file is ignored; \
+                     the top-level ledger's value governs"
+                ),
+                option: key.to_string(),
+                value: value.to_string(),
+            });
+            return;
+        }
+        self.set_inner(key, value);
+    }
+
+    fn set_inner(&mut self, key: &str, value: &str) {
         // Check for unknown options (E7001)
         let is_known = KNOWN_OPTIONS.contains(&key);
         if !is_known {
@@ -256,7 +362,7 @@ impl Options {
         if is_known && !is_repeatable && self.set_options.contains(key) {
             self.warnings.push(OptionWarning {
                 code: "E7003",
-                message: format!("Option \"{key}\" can only be specified once"),
+                message: format!("Option \"{key}\" is set more than once; the last value wins"),
                 option: key.to_string(),
                 value: value.to_string(),
             });
@@ -341,12 +447,7 @@ impl Options {
             }
             "inferred_tolerance_multiplier" => {
                 // Deprecated: renamed to tolerance_multiplier in Python beancount
-                self.warnings.push(OptionWarning {
-                    code: "E7004",
-                    message: "Renamed to 'tolerance_multiplier'.".to_string(),
-                    option: key.to_string(),
-                    value: value.to_string(),
-                });
+                self.warn_if_deprecated(key, value);
                 if let Ok(d) = Decimal::from_str(value) {
                     self.inferred_tolerance_multiplier = d;
                 } else {
@@ -552,12 +653,7 @@ impl Options {
             }
             "allow_pipe_separator" => {
                 // This option is deprecated in Python beancount
-                self.warnings.push(OptionWarning {
-                    code: "E7004",
-                    message: "Option 'allow_pipe_separator' is deprecated".to_string(),
-                    option: key.to_string(),
-                    value: value.to_string(),
-                });
+                self.warn_if_deprecated(key, value);
                 self.allow_pipe_separator = value.eq_ignore_ascii_case("true");
             }
             "long_string_maxlines" => {
@@ -602,13 +698,7 @@ impl Options {
             }
             "plugin" => {
                 // Deprecated: should use `plugin` directive instead of `option "plugin"`
-                self.warnings.push(OptionWarning {
-                    code: "E7004",
-                    message: "Option 'plugin' is deprecated; use the 'plugin' directive instead"
-                        .to_string(),
-                    option: key.to_string(),
-                    value: value.to_string(),
-                });
+                self.warn_if_deprecated(key, value);
             }
             _ => {
                 // Unknown options go to custom map
@@ -758,7 +848,108 @@ mod tests {
 
         assert_eq!(opts.warnings.len(), 1);
         assert_eq!(opts.warnings[0].code, "E7003");
-        assert!(opts.warnings[0].message.contains("only be specified once"));
+        // Wording matters here: the old text said the option "can only be
+        // specified once", which is not true -- bean-check accepts a
+        // redefinition and takes the last value, which is why #1546 asked for
+        // this to stop being an error. Saying so is the difference between a
+        // warning a reader can act on and one that looks like a rule.
+        assert!(
+            opts.warnings[0].message.contains("the last value wins"),
+            "got: {}",
+            opts.warnings[0].message,
+        );
+        // ...and last-wins is what actually happened.
+        assert_eq!(opts.title.as_deref(), Some("Second Title"));
+    }
+
+    /// An option set in an INCLUDED file does not govern the ledger.
+    ///
+    /// The value-changing cases are the point. `booking_method` decides which
+    /// lot a sale consumes and `inferred_tolerance_default` decides what
+    /// counts as balanced, so a sub-ledger setting either used to change
+    /// results for every other entity in the tree, including the master's own
+    /// transactions (#2151).
+    #[test]
+    fn included_files_do_not_govern_scoped_options() {
+        let mut opts = Options::new();
+        opts.set_scoped("title", "Master", true);
+        opts.set_scoped("booking_method", "LIFO", false);
+        opts.set_scoped("title", "Sub-ledger", false);
+
+        assert_eq!(
+            opts.title.as_deref(),
+            Some("Master"),
+            "the top-level ledger names the combined result, not whichever \
+             sub-ledger was included last",
+        );
+        assert!(
+            !opts.set_options.contains("booking_method"),
+            "an included booking_method must not reach the booker",
+        );
+        assert_eq!(opts.warnings.len(), 2, "each ignored option is reported");
+        assert!(
+            opts.warnings.iter().all(|w| w.code == "E7009"),
+            "must not reuse E7003: that one means specified-twice-last-wins and \
+             maps downstream to DuplicateOption, but an ignored option may be \
+             the only one of its name in the tree",
+        );
+        assert!(
+            opts.warnings
+                .iter()
+                .all(|w| w.message.contains("is ignored")),
+            "the warning has to say the value was dropped, or the user cannot \
+             tell why their setting had no effect",
+        );
+    }
+
+    /// Scoping must not downgrade a diagnostic that already existed.
+    ///
+    /// `option "plugin"` is deprecated and raises E7004, which `rledger check`
+    /// treats as an error. Reporting only the E7009 notice would silently turn
+    /// that into a warning, making an included file the one place a deprecated
+    /// option stopped failing the build.
+    #[test]
+    fn scoping_out_an_option_still_reports_its_deprecation() {
+        let mut opts = Options::new();
+        opts.set_scoped("plugin", "some.module", false);
+
+        let codes: Vec<&str> = opts.warnings.iter().map(|w| w.code).collect();
+        assert!(
+            codes.contains(&"E7004"),
+            "deprecation survives scoping: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"E7009"),
+            "and the ignore is still reported: {codes:?}"
+        );
+        assert!(
+            opts.warnings
+                .iter()
+                .any(|w| w.code == "E7004" && w.message.contains("deprecated")),
+            "the message must come from the shared table, not an empty default",
+        );
+    }
+
+    /// Options that describe the file declaring them still accumulate.
+    ///
+    /// A sub-ledger naming its own operating currency or document root is
+    /// describing itself rather than overriding its includer, so scoping must
+    /// not swallow these.
+    #[test]
+    fn included_files_still_contribute_accumulating_options() {
+        let mut opts = Options::new();
+        opts.set_scoped("operating_currency", "USD", true);
+        opts.set_scoped("operating_currency", "EUR", false);
+        opts.set_scoped("documents", "docs-from-include", false);
+
+        assert!(
+            opts.operating_currency.iter().any(|c| c == "EUR"),
+            "an included operating_currency must still be collected",
+        );
+        assert!(
+            opts.documents.iter().any(|d| d == "docs-from-include"),
+            "an included documents root must still be collected",
+        );
     }
 
     #[test]
