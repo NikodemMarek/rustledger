@@ -436,6 +436,15 @@ pub struct Table {
     pub columns: Vec<String>,
     /// Rows of data.
     pub rows: Vec<Vec<Value>>,
+    /// Columns this table omits from `SELECT *`, though they stay
+    /// addressable by explicit name.
+    ///
+    /// Per-table because bean-query's own wildcard is per-table: `meta` is
+    /// excluded from `SELECT *` on `#balances`, `#notes`, `#events` and
+    /// `#documents`, yet included (first) on `#commodities`. A name-only
+    /// rule cannot express that split. Empty for every table that hides
+    /// nothing beyond the name-based rule in `Executor::wildcard_hidden`.
+    pub hidden: Vec<String>,
 }
 
 impl Table {
@@ -445,7 +454,34 @@ impl Table {
         Self {
             columns,
             rows: Vec::new(),
+            hidden: Vec::new(),
         }
+    }
+
+    /// Mark columns as omitted from `SELECT *` expansion.
+    ///
+    /// The columns stay selectable by explicit name -- exactly bean-query's
+    /// behavior, which answers `SELECT meta FROM #notes` while leaving
+    /// `meta` out of `SELECT *` on that table.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if a named column is not in `columns`. Hiding is a
+    /// no-op for a name that does not exist, so a typo would silently leave
+    /// the column in `SELECT *` -- the exact failure this mechanism exists
+    /// to prevent, and one no test would catch except by asserting the full
+    /// wildcard set of that one table.
+    #[must_use]
+    pub fn with_hidden(mut self, hidden: &[&str]) -> Self {
+        debug_assert!(
+            hidden
+                .iter()
+                .all(|h| self.columns.iter().any(|c| c.eq_ignore_ascii_case(h))),
+            "with_hidden named a column this table does not have: {hidden:?} not all in {:?}",
+            self.columns
+        );
+        self.hidden = hidden.iter().map(|s| (*s).to_string()).collect();
+        self
     }
 
     /// Add a row to the table.
