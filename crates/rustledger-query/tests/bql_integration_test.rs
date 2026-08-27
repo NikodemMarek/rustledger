@@ -6694,6 +6694,149 @@ fn system_tables_preserve_source_order_within_a_date() {
 }
 
 #[test]
+fn empty_metadata_is_an_empty_map_not_null() {
+    // bean-query returns `{}` for a directive with no metadata, and renders
+    // Null as an empty CSV field, so the two are distinguishable there:
+    // `meta IS NULL` is false. We returned Null, making it true (#2162).
+    let directives = vec![
+        Directive::Open(Open::new(date(2024, 1, 1), "Assets:Cash")),
+        Directive::Note(Note::new(date(2024, 1, 3), "Assets:Cash", "no meta")),
+        Directive::Event(Event::new(date(2024, 1, 4), "loc", "Rome")),
+    ];
+
+    for table in ["#notes", "#events"] {
+        let result = execute_query(&format!("SELECT meta FROM {table}"), &directives);
+        assert_eq!(result.len(), 1, "{table} returned no row to assert on");
+        // Assert the exact value, not merely non-Null: a weaker check would
+        // also pass if per-table `meta` picked up the synthetic `filename` /
+        // `lineno` keys, which bean-query does NOT put there and which this
+        // change deliberately confines to #entries.
+        match &result.rows[0][0] {
+            Value::Object(map) => assert!(
+                map.is_empty(),
+                "{table} meta should be an EMPTY map for a directive with no \
+                 metadata; got {map:?}. Synthetic keys belong on #entries only."
+            ),
+            other => panic!(
+                "{table} meta should be an empty map, got {other:?}; \
+                 bean-query returns {{}} here"
+            ),
+        }
+
+        let is_null = execute_query(&format!("SELECT meta IS NULL FROM {table}"), &directives);
+        assert_eq!(
+            is_null.rows[0][0],
+            Value::Boolean(false),
+            "{table}: `meta IS NULL` must be false for absent metadata"
+        );
+    }
+}
+
+#[test]
+fn entries_meta_carries_filename_and_lineno() {
+    // bean-query's `#entries.meta` includes `filename` and `lineno` next to
+    // the user's keys. Its per-table `meta` columns (#notes, #balances, ...)
+    // do NOT -- verified against bean-query -- so this augmentation must stay
+    // on #entries rather than moving into the shared conversion, which would
+    // break the five tables #2161 brought into agreement (#2162).
+    use rustledger_loader::SourceMap;
+    use rustledger_parser::{Span, Spanned};
+
+    let dirs = [Directive::Note(Note::new(
+        date(2024, 1, 3),
+        "Assets:Cash",
+        "n",
+    ))];
+    let spanned: Vec<Spanned<rustledger_core::Directive>> = dirs
+        .iter()
+        .cloned()
+        .map(|d| Spanned {
+            value: d,
+            span: Span::new(0, 50),
+            file_id: 0,
+        })
+        .collect();
+    let source_map = SourceMap::new();
+    let mut executor = Executor::new_with_sources(&spanned, &source_map);
+    let result = executor
+        .execute(&parse("SELECT meta FROM #entries").expect("should parse"))
+        .expect("query should execute");
+
+    match &result.rows[0][0] {
+        Value::Object(map) => {
+            for key in ["filename", "lineno"] {
+                assert!(
+                    map.contains_key(key),
+                    "#entries.meta should carry `{key}`, got {map:?}"
+                );
+            }
+        }
+        other => panic!("#entries.meta should be a map, got {other:?}"),
+    }
+}
+
+#[test]
+fn source_keys_reach_entries_meta_but_not_per_table_meta() {
+    // The split this change depends on, pinned from both sides at once: the
+    // SAME directive, through the SAME executor, must carry `filename` /
+    // `lineno` in `#entries.meta` and must NOT carry them in `#notes.meta`.
+    // bean-query behaves exactly this way (measured), so putting the
+    // augmentation in the shared conversion instead would silently break the
+    // five per-table columns #2161 brought into agreement (#2162).
+    use rustledger_loader::SourceMap;
+    use rustledger_parser::{Span, Spanned};
+
+    let dirs = [Directive::Note(Note::new(
+        date(2024, 1, 3),
+        "Assets:Cash",
+        "n",
+    ))];
+    let spanned: Vec<Spanned<rustledger_core::Directive>> = dirs
+        .iter()
+        .cloned()
+        .map(|d| Spanned {
+            value: d,
+            span: Span::new(0, 50),
+            file_id: 0,
+        })
+        .collect();
+    let source_map = SourceMap::new();
+    let mut executor = Executor::new_with_sources(&spanned, &source_map);
+
+    let entries = executor
+        .execute(&parse("SELECT meta FROM #entries").expect("should parse"))
+        .expect("query should execute");
+    match &entries.rows[0][0] {
+        Value::Object(map) => {
+            for key in ["filename", "lineno"] {
+                assert!(
+                    map.contains_key(key),
+                    "#entries.meta lost `{key}`, got {map:?}"
+                );
+            }
+        }
+        other => panic!("#entries.meta should be a map, got {other:?}"),
+    }
+
+    let notes = executor
+        .execute(&parse("SELECT meta FROM #notes").expect("should parse"))
+        .expect("query should execute");
+    match &notes.rows[0][0] {
+        Value::Object(map) => {
+            for key in ["filename", "lineno"] {
+                assert!(
+                    !map.contains_key(key),
+                    "#notes.meta picked up `{key}`; bean-query keeps source keys \
+                     out of per-table meta. Did the augmentation move into the \
+                     shared conversion? got {map:?}"
+                );
+            }
+        }
+        other => panic!("#notes.meta should be a map, got {other:?}"),
+    }
+}
+
+#[test]
 fn select_star_matches_bean_query_per_table() {
     // bean-query's wildcard is NOT uniform about `meta`: it omits the column
     // on #balances/#notes/#events/#documents and includes it -- first -- on
