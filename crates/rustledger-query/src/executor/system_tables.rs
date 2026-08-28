@@ -724,7 +724,7 @@ impl Executor<'_> {
     /// Build the #postings table from transaction postings.
     ///
     /// Column schema matches Python beancount's `postings` table for compatibility.
-    pub(super) fn build_postings_table(&self) -> Table {
+    pub(super) fn build_postings_table(&self, query: &crate::ast::SelectQuery) -> Table {
         let columns = vec![
             // Entry-level columns
             "type".to_string(),
@@ -779,12 +779,48 @@ impl Executor<'_> {
             .scan_postings(
                 None,
                 None,
-                super::ScanNeeds {
-                    balance: true,
-                    account_balance: true,
-                    where_reads_balance: false,
-                    where_reads_account_balance: false,
-                    output_reads_account_balance: true,
+                // Gate the running-balance snapshots on whether the query
+                // reads them. These were hardcoded true, so
+                // `SELECT count(account) FROM #postings` paid for the
+                // cumulative `Inventory` clones per posting -- the #1080
+                // runaway -- on every system-table query (#2169).
+                //
+                // Worth 34% of the wall clock and 55% of peak RSS on a
+                // 40k-posting ledger (517MB -> 233MB), since the snapshots are
+                // retained `Inventory` copies. Both before and after scale
+                // linearly, so this is a constant factor, not a complexity
+                // fix -- the #1080 quadratic itself was already dealt with.
+                //
+                // The flags do NOT mean what they mean in `collect_postings`,
+                // and reusing that computation verbatim was wrong twice over:
+                //
+                //   * This scan gets `where_clause: None`. The table is built
+                //     first and filtered afterwards, so nothing is read "at
+                //     WHERE time" and both `where_reads_*` are false.
+                //   * The table materializes `account_balance` into every row
+                //     regardless of the SELECT list, so the TABLE is the
+                //     output. Gating on `output_references_column` released
+                //     the snapshot before the row was built, and
+                //     `WHERE account_balance != 0` then matched nothing.
+                //
+                // A wildcard reads every column, and unlike the default
+                // source -- whose `WILDCARD_COLUMNS` excludes both -- this
+                // table's `SELECT *` includes `balance` and
+                // `account_balance`, so it must force both on.
+                {
+                    let wildcard = query
+                        .targets
+                        .iter()
+                        .any(|t| matches!(t.expr, crate::ast::Expr::Wildcard));
+                    let account_balance =
+                        wildcard || super::query_references_column(query, "account_balance");
+                    super::ScanNeeds {
+                        balance: wildcard || super::query_references_column(query, "balance"),
+                        account_balance,
+                        where_reads_balance: false,
+                        where_reads_account_balance: false,
+                        output_reads_account_balance: account_balance,
+                    }
                 },
                 true,
             )
