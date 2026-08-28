@@ -2117,6 +2117,26 @@ impl<'a> Executor<'a> {
         // with no metadata and renders Null as an empty CSV field, so the
         // two are distinguishable there: `meta IS NULL` is false where we
         // used to make it true (#2162).
+        // Alphabetical, deliberately NOT bean-query's order. bean-query emits
+        // `filename`/`lineno` first and then the user's keys in declaration
+        // order; we cannot reproduce either half. `Metadata` is an
+        // `FxHashMap`, so declaration order is already lost at parse time,
+        // and `Value::Object` is a `BTreeMap`, so the query layer cannot
+        // impose an order even if it knew one. Matching would mean an
+        // order-preserving map in `rustledger-core`: a new dependency
+        // (`indexmap` is not one today) and a changed rkyv layout, since
+        // `Metadata` is part of the archived cache payload and rkyv is a
+        // default feature -- so a `CACHE_VERSION` bump too. All to change the
+        // order keys print in. Measured and declined in #2168.
+        //
+        // `meta.hash` is NOT at risk, contrary to an earlier draft of this
+        // comment: `rustledger-ffi-wasi::hash` sorts the keys itself before
+        // hashing, precisely because `Metadata` is a hash map, so the digest
+        // is already independent of iteration order.
+        //
+        // The sort is also what makes `SELECT meta` deterministic at all,
+        // given the hash-map source. Same shape as the `#prices` ordering
+        // in #2163.
         let map: std::collections::BTreeMap<String, Value> = meta
             .iter()
             .map(|(k, v)| (k.clone(), Self::meta_value_to_value(Some(v))))
