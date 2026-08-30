@@ -45,6 +45,195 @@ fn count_directive_type(result: &ParseResult, type_name: &str) -> usize {
 // ============================================================================
 
 #[test]
+fn balance_tolerance_follows_an_arithmetic_amount() {
+    // The tolerance was being swallowed INTO the amount expression, so
+    // `0.25 + 0.75 ~ 0.01 USD` parsed as the non-expression
+    // `0.25 + 0.75 ~ 0.01` and was reported malformed. Only the
+    // currency-less arithmetic form hit it: with a currency after the
+    // expression the scan stopped there and parsed fine, which is why the
+    // plain-number form worked and its arithmetic sibling did not (#2191).
+    let forms = [
+        ("100.00 USD", dec_str("100.00")),
+        ("100.00 ~ 0.01 USD", dec_str("100.00")),
+        ("100.00 USD ~ 0.01 USD", dec_str("100.00")),
+        ("0.25 + 0.75 USD", dec_str("1.00")),
+        ("0.25 + 0.75 ~ 0.01 USD", dec_str("1.00")),
+        ("0.25 + 0.75 USD ~ 0.01 USD", dec_str("1.00")),
+        ("(0.25 + 0.75) ~ 0.01 USD", dec_str("1.00")),
+    ];
+
+    for (form, want) in forms {
+        let src = format!("2024-01-15 balance Assets:Cash {form}\n");
+        let result = rustledger_parser::parse(&src);
+        assert!(
+            result.errors.is_empty(),
+            "`{form}` must parse: {:?}",
+            result.errors,
+        );
+        let balance = result
+            .directives
+            .iter()
+            .find_map(|d| match &d.value {
+                Directive::Balance(b) => Some(b),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{form}` produced no balance directive"));
+        // The VALUE matters more than the parse. An earlier bug in this same
+        // scan fell back to "take the first NUMBER", which turned
+        // `(1 + 5) / 2.1` into a silent assertion against 1 -- parsed
+        // cleanly, asserted the wrong thing.
+        assert_eq!(
+            balance.amount.number, want,
+            "`{form}` evaluated to the wrong amount",
+        );
+    }
+}
+
+#[test]
+fn a_price_rejects_a_tolerance_instead_of_discarding_it() {
+    // `~` ends the amount expression on a `balance`, which is what makes
+    // `0.25 + 0.75 ~ 0.01 USD` parse. Applying that to `price` as well would
+    // be a regression, not a fix: a price has no tolerance, so the amount
+    // would evaluate and the tolerance would vanish without a word.
+    //
+    // The plain form was already accepted that way before any of this --
+    // `~` is not an arithmetic operator, so the scan took the fast path and
+    // fell back to the first NUMBER, yielding 1.10 and dropping the rest.
+    // A value the author wrote and the parser discarded in silence is worse
+    // than a diagnosed error, so both forms are now diagnosed.
+    for src in [
+        "2024-01-01 price USD 1.10 ~ 0.01 EUR\n",
+        "2024-01-01 price USD 1.10 + 0.05 ~ 0.01 EUR\n",
+    ] {
+        let result = rustledger_parser::parse(src);
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                &e.kind,
+                rustledger_parser::ParseErrorKind::SyntaxError(m)
+                    if m.contains("a price has no tolerance")
+            )),
+            "`{src}` must be diagnosed, not silently truncated: {:?}",
+            result.errors,
+        );
+        assert!(
+            !result
+                .directives
+                .iter()
+                .any(|d| matches!(d.value, Directive::Price(_))),
+            "`{src}` must not also yield a price directive",
+        );
+    }
+
+    // The tolerance-free forms still parse, and to the right value.
+    for (src, want) in [
+        ("2024-01-01 price USD 1.10 EUR\n", dec_str("1.10")),
+        ("2024-01-01 price USD 1.10 + 0.05 EUR\n", dec_str("1.15")),
+        ("2024-01-01 price USD (1.10 + 0.05) EUR\n", dec_str("1.15")),
+    ] {
+        let result = rustledger_parser::parse(src);
+        assert!(result.errors.is_empty(), "`{src}`: {:?}", result.errors);
+        let price = result
+            .directives
+            .iter()
+            .find_map(|d| match &d.value {
+                Directive::Price(p) => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{src}` produced no price"));
+        assert_eq!(price.amount.number, want, "`{src}`");
+    }
+}
+
+#[test]
+fn every_directive_either_keeps_tags_or_refuses_them() {
+    // The failure mode this session kept finding is a third state: accept the
+    // tag, then drop it because the model has nowhere to put it. `query` was
+    // in it -- absent from both the accepting set and the refusing set --
+    // while the refusal message names the rule its omission broke.
+    //
+    // A census rather than one case, so a directive added later that forgets
+    // to pick a side is caught here instead of by a user.
+    let refuses = [
+        ("open", "2024-01-01 open Assets:A USD"),
+        ("close", "2024-01-01 close Assets:A"),
+        ("commodity", "2024-01-01 commodity USD"),
+        ("event", "2024-01-01 event \"location\" \"NYC\""),
+        ("price", "2024-01-01 price USD 1.10 EUR"),
+        ("balance", "2024-01-01 balance Assets:A 0 USD"),
+        ("pad", "2024-01-01 pad Assets:A Equity:O"),
+    ];
+    for (name, header) in refuses {
+        for sigil in ["#atag", "^alink"] {
+            let src = format!("{header} {sigil}\n");
+            let result = rustledger_parser::parse(&src);
+            assert!(
+                !result.errors.is_empty(),
+                "`{name}` accepted {sigil} it has no field to hold",
+            );
+        }
+        // And the tag-free form is still fine -- a rejection that also
+        // rejected valid input would pass the assertion above.
+        let result = rustledger_parser::parse(&format!("{header}\n"));
+        assert!(
+            result.errors.is_empty(),
+            "`{name}` broke without a tag: {:?}",
+            result.errors,
+        );
+    }
+
+    // `query` is in NEITHER set: it accepts a tag and drops it, because
+    // `Query` has no field to hold one. Pinned here as the current behavior
+    // rather than asserted as correct -- whether it should refuse (matching
+    // beancount's `Query`, which has no tags field) or keep them (as `note`
+    // now does) needs bean-check, which this test cannot run. See #2194.
+    //
+    // Written as an assertion so the day it changes, this fails and the
+    // census gets updated instead of quietly going stale.
+    for sigil in ["#atag", "^alink"] {
+        let src = format!("2024-01-01 query \"n\" \"SELECT date\" {sigil}\n");
+        let result = rustledger_parser::parse(&src);
+        assert!(
+            result.errors.is_empty(),
+            "`query` now diagnoses {sigil} -- good, but update this census \
+             and #2194: {:?}",
+            result.errors,
+        );
+    }
+
+    // The three that DO keep them.
+    let keeps = [
+        ("note", "2024-01-01 note Assets:A \"n\" #atag ^alink\n"),
+        (
+            "document",
+            "2024-01-01 document Assets:A \"/x.pdf\" #atag ^alink\n",
+        ),
+        (
+            "transaction",
+            "2024-01-01 * \"t\" #atag ^alink\n  Assets:A  1 USD\n  Equity:O\n",
+        ),
+    ];
+    for (name, src) in keeps {
+        let result = rustledger_parser::parse(src);
+        assert!(result.errors.is_empty(), "`{name}`: {:?}", result.errors);
+        let (tags, links) = result
+            .directives
+            .iter()
+            .find_map(|d| match &d.value {
+                Directive::Note(n) => Some((n.tags.len(), n.links.len())),
+                Directive::Document(x) => Some((x.tags.len(), x.links.len())),
+                Directive::Transaction(t) => Some((t.tags.len(), t.links.len())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{name}` produced no directive"));
+        assert_eq!((tags, links), (1, 1), "`{name}` did not keep both");
+    }
+}
+
+fn dec_str(s: &str) -> rustledger_core::Decimal {
+    s.parse().expect("test decimal")
+}
+
+#[test]
 fn test_parse_open_directive() {
     let source = r"2024-01-01 open Assets:Bank:Checking USD, EUR";
     let result = parse_ok(source);
