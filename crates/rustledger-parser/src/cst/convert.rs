@@ -565,32 +565,35 @@ fn convert_commodity(
     Some(Spanned::new(Directive::Commodity(commodity), span))
 }
 
-fn convert_note(
-    node: &NoteDirective,
-    bom_offset: u32,
-    errors: &mut Vec<crate::ParseError>,
-) -> Option<Spanned<Directive>> {
-    let date = parse_directive_date(&node.date()?, errors, bom_offset)?;
-    let account = Account::new(node.account()?.text());
-    let comment = node.text()?.text_decoded()?;
-    // Trailing tags/links on the note header, collected the same way
-    // `convert_document` does: TAG / LINK tokens appear only in the header,
-    // never in META_ENTRY children, so a direct-child token walk that stops at
-    // the first NEWLINE captures them in source order.
-    //
-    // beancount v3 accepts these on a `note`. We parsed them and threw them
-    // away, because `Note` had nowhere to put them (#2160) -- note this
-    // directive does NOT call `reject_tags_and_links`, unlike `commodity` and
-    // `event`, so they were accepted and silently dropped rather than
-    // diagnosed.
+/// Collect the `#tag` / `^link` tokens on a directive's HEADER line.
+///
+/// Stops at the newline that ends the header -- but only after the header has
+/// actually started. A directive node can begin with leading trivia: when a
+/// blank line precedes it, the node's first token is a NEWLINE, and breaking
+/// on that dropped every tag. Both `note` and `document` did this, so a
+/// `document` written the way ledgers are normally formatted -- a blank line
+/// between directives -- silently lost its tags long before `note` gained any
+/// (#2160 review).
+///
+/// The formatter already had this right: its header walks guard on a
+/// `seen_content` flag for the same reason (`cst/format.rs`). The converter
+/// was the outlier.
+///
+/// The header is deemed started once the directive's STRING has been seen:
+/// the comment for a `note`, the path for a `document`. Tags and links follow
+/// it on the same line, and metadata lines live in `META_ENTRY` child nodes
+/// rather than as direct tokens, so they cannot leak in.
+fn header_tags_and_links(node: &crate::SyntaxNode) -> (Vec<Tag>, Vec<Link>) {
     let mut tags: Vec<Tag> = Vec::new();
     let mut links: Vec<Link> = Vec::new();
-    for el in node.syntax().children_with_tokens() {
+    let mut header_started = false;
+    for el in node.children_with_tokens() {
         let rowan::NodeOrToken::Token(t) = el else {
             continue;
         };
         match t.kind() {
-            crate::SyntaxKind::NEWLINE => break,
+            crate::SyntaxKind::STRING => header_started = true,
+            crate::SyntaxKind::NEWLINE if header_started => break,
             crate::SyntaxKind::TAG => {
                 tags.push(Tag::new(t.text().trim_start_matches('#')));
             }
@@ -600,6 +603,27 @@ fn convert_note(
             _ => {}
         }
     }
+    (tags, links)
+}
+
+fn convert_note(
+    node: &NoteDirective,
+    bom_offset: u32,
+    errors: &mut Vec<crate::ParseError>,
+) -> Option<Spanned<Directive>> {
+    let date = parse_directive_date(&node.date()?, errors, bom_offset)?;
+    let account = Account::new(node.account()?.text());
+    let comment = node.text()?.text_decoded()?;
+    // Trailing tags/links on the note header, collected the same way
+    // `convert_document` does -- see `header_tags_and_links` for why "the
+    // first NEWLINE" is the wrong place to stop.
+    //
+    // beancount v3 accepts these on a `note`. We parsed them and threw them
+    // away, because `Note` had nowhere to put them (#2160) -- note this
+    // directive does NOT call `reject_tags_and_links`, unlike `commodity` and
+    // `event`, so they were accepted and silently dropped rather than
+    // diagnosed.
+    let (tags, links) = header_tags_and_links(node.syntax());
     let meta = convert_meta_entries(node.syntax());
 
     let note = rustledger_core::directive::Note {
@@ -625,26 +649,10 @@ fn convert_document(
     // Trailing tags/links on the document header (legacy
     // `parse_document_directive` collects them in a loop after
     // the path STRING). TAG / LINK tokens only appear in the
-    // header (not in META_ENTRY children, which are walked
-    // separately below), so a direct-child token walk that
-    // stops at the first NEWLINE captures them in source order.
-    let mut tags: Vec<Tag> = Vec::new();
-    let mut links: Vec<Link> = Vec::new();
-    for el in node.syntax().children_with_tokens() {
-        let rowan::NodeOrToken::Token(t) = el else {
-            continue;
-        };
-        match t.kind() {
-            crate::SyntaxKind::NEWLINE => break,
-            crate::SyntaxKind::TAG => {
-                tags.push(Tag::new(t.text().trim_start_matches('#')));
-            }
-            crate::SyntaxKind::LINK => {
-                links.push(Link::new(t.text().trim_start_matches('^')));
-            }
-            _ => {}
-        }
-    }
+    // header, not in the META_ENTRY children walked separately
+    // below -- see `header_tags_and_links` for where the walk
+    // has to start and stop.
+    let (tags, links) = header_tags_and_links(node.syntax());
     let meta = convert_meta_entries(node.syntax());
 
     let document = rustledger_core::directive::Document {
