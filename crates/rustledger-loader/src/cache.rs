@@ -460,12 +460,18 @@ const CACHE_MAGIC: &[u8; 8] = b"RLEDGER\0";
 ///     while testing the fix -- the matrices kept diverging until the stale
 ///     caches were cleared.
 ///
+/// v31: `Note` gained `tags` and `links` (#2160). The parser always accepted
+///     them on a note header and threw them away; now it keeps them, so the
+///     archived layout has two more fields. Without the bump a cache written
+///     by an older binary deserializes into the new struct and every note
+///     comes back with no tags -- the exact bug, resurrected from disk.
+///
 /// Public so `rustledger-wasm` can pin its own cache version against this one.
 /// Both caches archive the same `Vec<Directive>`, so a parser change that
 /// alters PARSER OUTPUT has to bump both — and on #1942 only this one was
 /// bumped, which review caught rather than any test. See
 /// `loader_cache_version_is_pinned` in `rustledger-wasm/src/cache.rs`.
-pub const CACHE_VERSION: u32 = 30;
+pub const CACHE_VERSION: u32 = 31;
 
 /// Cache header stored at the start of cache files.
 #[derive(Debug, Clone)]
@@ -1202,7 +1208,14 @@ mod tests {
         // file stop being applied. That changes which OPTIONS a load resolves,
         // not how a `CostNumber` is archived, so the byte arrays below are
         // untouched and only FIXTURE_VERSION moves.
-        const FIXTURE_VERSION: u32 = 30;
+        // v31 (#2160) is the FIRST bump in this list that genuinely moves an
+        // archived layout: `Note` gained `tags` and `links`. The byte arrays
+        // below are still valid, but for a different reason than v25/v30 --
+        // not "no layout moved" but "the layout that moved is not this one".
+        // They pin `CostNumber` discriminants and payload encodings, which
+        // `Note` does not participate in. A future bump that touches
+        // `CostNumber` itself has to regenerate them.
+        const FIXTURE_VERSION: u32 = 31;
         assert_eq!(
             CACHE_VERSION, FIXTURE_VERSION,
             "CACHE_VERSION advanced past the fixture version; regenerate \
@@ -1305,7 +1318,11 @@ mod tests {
         // must still match — and the assertion, not this comment, proves it.
         // v30 (#2151) changes which options an included file contributes,
         // not how a `MetaValue` is archived; the hash below is unchanged.
-        const FIXTURE_VERSION: u32 = 30;
+        // v31 (#2160) adds `tags` and `links` to `Note`. That moves `Note`'s
+        // archived layout, not `MetaValue`'s -- the two new fields are
+        // `Vec<Tag>` and `Vec<Link>`, neither of which is a `MetaValue` -- so
+        // the hash below is unchanged and the assertion proves it.
+        const FIXTURE_VERSION: u32 = 31;
         const META_VALUE_LAYOUT_HASH: &str =
             "43e3c258fe376cede6a6c2c975100bcf67ddda0ab84b21566b123c01e0a54b25";
         assert_eq!(

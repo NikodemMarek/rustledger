@@ -254,21 +254,25 @@ impl Executor<'_> {
 
     /// Build the #notes table from note directives.
     ///
-    /// The table has columns: date, account, comment, meta
+    /// The table has columns: date, account, comment, tags, links, meta
     /// - date: The date of the note
     /// - account: The account the note is attached to
     /// - comment: The note text
+    /// - tags: The note's tags (as a set)
+    /// - links: The note's links (as a set)
     /// - meta: The directive's metadata (hidden from `SELECT *`)
     ///
-    /// bean-query also exposes `tags` and `links` here. Our `Note` model
-    /// drops them at parse time, so they cannot be surfaced until #2160
-    /// lands — a column census cannot see that, since the columns are
-    /// simply absent.
+    /// `tags` and `links` are VISIBLE, matching bean-query's wildcard here.
+    /// They could not be surfaced at all until #2160, because `Note` had no
+    /// fields to hold them and the parser discarded them -- a column census
+    /// could not see that, since the columns were simply absent.
     pub(super) fn build_notes_table(&self) -> Table {
         let columns = vec![
             "date".to_string(),
             "account".to_string(),
             "comment".to_string(),
+            "tags".to_string(),
+            "links".to_string(),
             "meta".to_string(),
         ];
         let mut table = Table::new(columns).with_hidden(&["meta"]);
@@ -278,7 +282,14 @@ impl Executor<'_> {
             .resolved_directives()
             .filter_map(|d| {
                 if let Directive::Note(n) = d {
-                    Some((n.date, n.account.as_ref(), n.comment.as_str(), &n.meta))
+                    Some((
+                        n.date,
+                        n.account.as_ref(),
+                        n.comment.as_str(),
+                        &n.tags,
+                        &n.links,
+                        &n.meta,
+                    ))
                 } else {
                     None
                 }
@@ -304,11 +315,15 @@ impl Executor<'_> {
         // together, which is stable under that edit. Divergence by choice.
         notes.sort_by_key(|(date, ..)| *date);
 
-        for (date, account, comment, meta) in notes {
+        for (date, account, comment, tags, links, meta) in notes {
+            let tags_vec: Vec<String> = tags.iter().map(ToString::to_string).collect();
+            let links_vec: Vec<String> = links.iter().map(ToString::to_string).collect();
             let row = vec![
                 Value::Date(date),
                 Value::String(account.to_string()),
                 Value::String(comment.to_string()),
+                Value::StringSet(tags_vec),
+                Value::StringSet(links_vec),
                 Self::metadata_to_value(meta),
             ];
             table.add_row(row);
@@ -679,8 +694,8 @@ impl Executor<'_> {
                 // same as payee and narration.
                 //
                 // Tags and links are NOT in that group. `note` and `document`
-                // carry them in beancount v3, and a document's already survive
-                // into our model -- `SELECT tags FROM #documents` returns them.
+                // both carry them in beancount v3, and both now survive into
+                // our model -- a document's always did, a note's since #2160.
                 // Emptying them here made `#entries` disagree with `#documents`
                 // about the same directive (#2154). A column-presence census
                 // cannot see this: `tags` IS registered on `#entries`, it was
@@ -689,6 +704,13 @@ impl Executor<'_> {
                     Directive::Document(doc) => (
                         doc.tags.iter().map(ToString::to_string).collect(),
                         doc.links.iter().map(ToString::to_string).collect(),
+                    ),
+                    // `note` carries them too, since #2160 gave `Note` the
+                    // fields. This arm was Document-only because a note's
+                    // tags did not survive parsing; the comment above said so.
+                    Directive::Note(note) => (
+                        note.tags.iter().map(ToString::to_string).collect(),
+                        note.links.iter().map(ToString::to_string).collect(),
                     ),
                     _ => (Vec::new(), Vec::new()),
                 };
