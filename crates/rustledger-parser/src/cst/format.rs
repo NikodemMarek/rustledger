@@ -1575,6 +1575,9 @@ fn emit_note(d: &ast::NoteDirective, group: GroupingStyle<'_>, out: &mut String)
     out.push_str(&account);
     out.push(' ');
     out.push_str(&text);
+    // beancount v3 accepts tags and links on a note header, and dropping them
+    // here silently deleted user data on every `rledger format` run (#2184).
+    emit_header_tags_and_links(d.syntax(), out);
     out.push('\n');
     emit_meta_entries_of(d.syntax(), group, out);
 }
@@ -1627,6 +1630,49 @@ fn emit_pad(d: &ast::PadDirective, group: GroupingStyle<'_>, out: &mut String) {
     emit_meta_entries_of(d.syntax(), group, out);
 }
 
+/// Re-emit the trailing `#tag` / `^link` tokens of a directive header.
+///
+/// The typed AST has no accessor for them, so this walks direct-child tokens.
+/// Two things make that harder than it sounds, and both are bugs that have
+/// been fixed here before:
+///
+/// - Skip LEADING trivia. A blank line before a non-first directive attaches
+///   its NEWLINE inside the node, so a walk that stopped at "the first
+///   NEWLINE" would stop before the header and drop every tag (#1321 in the
+///   transaction path, and #2189 in the converter, which had the same shape).
+/// - Skip leading COMMENT lines too, not just whitespace. A comment before a
+///   non-first directive attaches inside this node (Directive-Terminator
+///   Rule); treating it as content would flip `seen_content`, break at the
+///   comment's own NEWLINE, and drop the real header tags.
+///
+/// `document` carried this walk alone while `note` had none, so formatting a
+/// note deleted its tags and links (#2184). Sharing it is what keeps the two
+/// from drifting apart again.
+fn emit_header_tags_and_links(node: &crate::SyntaxNode, out: &mut String) {
+    let mut seen_content = false;
+    for el in node.children_with_tokens() {
+        let rowan::NodeOrToken::Token(t) = el else {
+            // A child NODE is header content, not a reason to stop. For today's
+            // two callers it can only be a META_ENTRY, which sits past the
+            // header newline the walk has already broken on -- but stopping
+            // here would mean a header that ever gains a child node silently
+            // loses the tags after it, and nothing would say so.
+            seen_content = true;
+            continue;
+        };
+        match t.kind() {
+            crate::SyntaxKind::TAG | crate::SyntaxKind::LINK => {
+                out.push(' ');
+                out.push_str(t.text());
+                seen_content = true;
+            }
+            crate::SyntaxKind::NEWLINE if seen_content => break,
+            k if k.is_trivia() => {}
+            _ => seen_content = true,
+        }
+    }
+}
+
 fn emit_document(d: &ast::DocumentDirective, group: GroupingStyle<'_>, out: &mut String) {
     let date = d.date().map(|t| t.text().to_string()).unwrap_or_default();
     let account = d
@@ -1639,35 +1685,7 @@ fn emit_document(d: &ast::DocumentDirective, group: GroupingStyle<'_>, out: &mut
     out.push_str(&account);
     out.push(' ');
     out.push_str(&path);
-    // Trailing TAG / LINK tokens — typed AST has no accessor, so
-    // walk direct-child tokens. Skip LEADING trivia (a blank line
-    // before a non-first directive attaches its NEWLINE inside the
-    // node) and stop at the first NEWLINE *after* the header content
-    // begins; otherwise the tags/links are dropped when reformatting
-    // any document past the first — the same bug as #1321 in the
-    // transaction path.
-    let mut seen_content = false;
-    for el in d.syntax().children_with_tokens() {
-        let rowan::NodeOrToken::Token(t) = el else {
-            break;
-        };
-        match t.kind() {
-            crate::SyntaxKind::TAG | crate::SyntaxKind::LINK => {
-                out.push(' ');
-                out.push_str(t.text());
-                seen_content = true;
-            }
-            crate::SyntaxKind::NEWLINE if seen_content => break,
-            // Leading trivia before the date: whitespace, blank-line
-            // NEWLINEs, AND comment lines. A comment before a non-first
-            // directive attaches inside this node (Directive-Terminator
-            // Rule); skipping only WHITESPACE/NEWLINE would let it flip
-            // `seen_content`, break at the comment's NEWLINE, and drop
-            // the real header tags/links.
-            k if k.is_trivia() => {}
-            _ => seen_content = true,
-        }
-    }
+    emit_header_tags_and_links(d.syntax(), out);
     out.push('\n');
     emit_meta_entries_of(d.syntax(), group, out);
 }
@@ -3709,7 +3727,14 @@ mod tests {
         // ---- per-variant coverage ---------------------------------
         ("close_directive", "2024-12-31 close Assets:Cash\n"),
         ("commodity_directive", "2024-01-01 commodity HOOL\n"),
-        ("note_directive", "2024-01-15 note Assets:Cash \"a note\"\n"),
+        // Tagged and linked on purpose. Untagged, this fixture could not see
+        // a note losing its tags -- which is exactly what happened: the
+        // emitters dropped them and every harness in this file passed
+        // (#2184).
+        (
+            "note_directive",
+            "2024-01-15 note Assets:Cash \"a note\" #n1 ^l1\n",
+        ),
         ("event_directive", "2024-01-15 event \"location\" \"NYC\"\n"),
         (
             "query_directive",
@@ -3718,7 +3743,7 @@ mod tests {
         ("pad_directive", "2024-01-15 pad Assets:A Equity:Opening\n"),
         (
             "document_directive",
-            "2024-06-01 document Assets:Bank \"stmt.pdf\" #q1\n",
+            "2024-06-01 document Assets:Bank \"stmt.pdf\" #q1 ^d1\n",
         ),
         // Note: `#!` and `#+` anywhere on a line, not just at
         // line start, open the lexer's SHEBANG / EMACS_DIRECTIVE
@@ -3827,6 +3852,166 @@ mod tests {
             &*normalized
         );
         assert!(normalized.ends_with('\n') && !normalized.ends_with("\r\n"));
+    }
+
+    /// Every fixture must survive the TYPED emitter, not just `format_source`.
+    ///
+    /// `canonicalize_directives` is the path `rledger add`, `rledger extract`
+    /// and the FFI `format.entry` endpoints take, and it renders through
+    /// `rustledger_core::format::format_directives` -- a different emitter
+    /// with its own set of fields it might forget. It forgot a note's and a
+    /// document's tags and links, and the fidelity test next door could not
+    /// see it because that one exercises `format_source`.
+    ///
+    /// Same shape as that test, aimed at the other emitter: parse, render,
+    /// parse, compare models.
+    #[test]
+    fn canonicalizing_every_fixture_preserves_the_model() {
+        let cfg = rustledger_core::format::FormatConfig::default();
+        let mut checked = 0;
+        for (name, src) in IDEMPOTENCE_MATRIX {
+            let before = crate::parse(src);
+            if !before.errors.is_empty() || before.directives.is_empty() {
+                continue;
+            }
+            let ds: Vec<_> = before.directives.iter().map(|d| d.value.clone()).collect();
+            let out = match canonicalize_directives(ds.iter(), &cfg) {
+                Ok(out) => out,
+                // The shim reports a re-parse failure rather than emitting a
+                // recoverable subset; that is its contract, not a silent loss.
+                Err(e) => panic!("{name}: canonicalize failed: {e:?}"),
+            };
+            let after = crate::parse(&out);
+            assert!(
+                after.errors.is_empty(),
+                "{name}: typed emitter produced unparsable text: {:?}\n{out}",
+                after.errors,
+            );
+            let a: Vec<_> = after.directives.iter().map(|d| &d.value).collect();
+            let b: Vec<_> = ds.iter().collect();
+            assert_eq!(
+                b, a,
+                "{name}: the typed emitter changed the directives\n\
+                 --- source ---\n{src}\n--- rendered ---\n{out}",
+            );
+            checked += 1;
+        }
+        // Fixtures that parse to no directive at all (comments, options) are
+        // skipped above; the floor keeps that from quietly becoming all of them.
+        assert!(
+            checked >= 30,
+            "only {checked} fixtures reached the typed emitter"
+        );
+    }
+
+    /// The typed-directive emitter must not delete tags either.
+    ///
+    /// There are TWO live formatters. `format_source` is what `rledger
+    /// format` runs; `canonicalize_directives` is what `rledger add`,
+    /// `rledger extract` and the FFI `format.entry` endpoints run, and it
+    /// synthesizes its intermediate text through
+    /// `rustledger_core::format::format_directives`.
+    ///
+    /// Fixing only the first left the second deleting the same data -- and
+    /// deleting MORE of it, since the CST emitter at least kept a document's
+    /// tags while the typed one dropped those too. A round-trip through this
+    /// shim is what a caller building directives in memory actually gets.
+    #[test]
+    fn canonicalizing_typed_directives_keeps_tags_and_links() {
+        let src = "2024-01-05 note Assets:A \"n\" #ntag ^nlink\n\
+                   2024-01-06 document Assets:A \"/x.pdf\" #dtag ^dlink\n\
+                   2024-01-07 * \"t\" #ttag ^tlink\n\
+                  \x20 Assets:A  1 USD\n\
+                  \x20 Equity:O\n";
+        let parsed = crate::parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let directives: Vec<_> = parsed.directives.iter().map(|d| d.value.clone()).collect();
+
+        let out = canonicalize_directives(
+            directives.iter(),
+            &rustledger_core::format::FormatConfig::default(),
+        )
+        .expect("fixture must canonicalize");
+
+        for marker in ["#ntag", "^nlink", "#dtag", "^dlink", "#ttag", "^tlink"] {
+            assert!(
+                out.contains(marker),
+                "typed emitter dropped {marker}\n{out}"
+            );
+        }
+
+        // And the text it produced still means the same thing.
+        let after = crate::parse(&out);
+        assert!(after.errors.is_empty(), "{:?}\n{out}", after.errors);
+        let a: Vec<_> = after.directives.iter().map(|d| &d.value).collect();
+        let b: Vec<_> = directives.iter().collect();
+        assert_eq!(b, a, "canonicalizing changed the directives\n{out}");
+    }
+
+    /// Formatting a note must not change what it means.
+    ///
+    /// The idempotence matrix next door cannot catch this class: dropping a
+    /// note's tags is perfectly idempotent, and it passed for as long as
+    /// #2184 lived. Stability is not fidelity, so this parses, formats,
+    /// parses again, and compares the models.
+    ///
+    /// Scoped to note and document deliberately. The same check over the
+    /// whole matrix fails on `balance_with_arithmetic_and_tolerance`, where
+    /// the formatter emits output that no longer parses (#2191); it lands
+    /// with that fix rather than behind an allow-list here.
+    #[test]
+    fn formatting_preserves_a_notes_tags_and_links() {
+        // A note past the first, after a blank line and after a comment:
+        // both attach trivia inside the directive node, which is what broke
+        // the equivalent walk in the converter (#2189).
+        let src = "2024-01-01 open Assets:A USD\n\
+                   \n\
+                   2024-01-05 note Assets:A \"first\" #n1 ^l1\n\
+                   \n\
+                   2024-01-06 note Assets:A \"after blank\" #n2 ^l2\n\
+                   ; a comment line\n\
+                   2024-01-07 note Assets:A \"after comment\" #n3\n\
+                   2024-01-08 note Assets:A \"with meta\" #n4\n\
+                  \x20 key: \"v\"\n\
+                   \n\
+                   2024-01-09 document Assets:A \"/x.pdf\" #d1 ^l3\n";
+
+        let before = crate::parse(src);
+        assert!(before.errors.is_empty(), "{:?}", before.errors);
+        let formatted = format_source(src);
+        let after = crate::parse(&formatted);
+        assert!(
+            after.errors.is_empty(),
+            "formatted output no longer parses: {:?}\n{formatted}",
+            after.errors,
+        );
+
+        let b: Vec<_> = before.directives.iter().map(|d| &d.value).collect();
+        let a: Vec<_> = after.directives.iter().map(|d| &d.value).collect();
+        assert_eq!(
+            b, a,
+            "formatting changed the directives it parsed from\n\
+             --- source ---\n{src}\n--- formatted ---\n{formatted}",
+        );
+
+        // The model comparison above is NOT sufficient on its own, and this
+        // is not a hypothetical: run it against a tree whose CONVERTER also
+        // drops these tags (#2189) and both sides come back tagless and
+        // equal, while every tag in the file has been deleted. Assert on the
+        // formatter's own output text, which is the thing under change here
+        // and cannot be satisfied by a matching pair of empty models.
+        for tag in ["#n1", "#n2", "#n3", "#n4", "#d1"] {
+            assert!(
+                formatted.contains(tag),
+                "formatter dropped {tag}\n{formatted}"
+            );
+        }
+        for link in ["^l1", "^l2", "^l3"] {
+            assert!(
+                formatted.contains(link),
+                "formatter dropped {link}\n{formatted}"
+            );
+        }
     }
 
     #[test]
