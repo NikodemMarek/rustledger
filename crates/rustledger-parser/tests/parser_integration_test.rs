@@ -215,6 +215,196 @@ fn every_directive_either_keeps_tags_or_refuses_them() {
     }
 }
 
+/// The divergence table in the docs must describe what actually ships.
+///
+/// `docs/reference/compatibility.md` is where a user goes to find out why
+/// their file loads here and not in beancount, and it restates the same rows
+/// the test below pins. Two copies of one table drift, and the copy that goes
+/// stale is the prose one, because nothing runs it.
+///
+/// So this runs it: every row of the markdown table is parsed and checked
+/// against the behavior it claims. It does NOT re-check beancount -- that
+/// column is a recorded measurement, not something reproducible without the
+/// container -- only our own half, which is the half that can change under
+/// the document.
+#[test]
+fn the_documented_tolerance_table_matches_behavior() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/reference/compatibility.md"),
+    )
+    .expect("compatibility.md must be readable from the parser crate");
+
+    let section = doc
+        .split("### 6. Balance Tolerance Grammar")
+        .nth(1)
+        .and_then(|s| s.split("### 7.").next())
+        .expect("the tolerance section must exist under that heading");
+
+    let mut rows = 0;
+    for line in section.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // `| form | beancount | rustledger |` -> ["", form, bc, rl, ""]
+        if cells.len() != 5 || !cells[1].starts_with('`') {
+            continue;
+        }
+        let form = cells[1].trim_matches('`');
+        let claim = cells[3].replace('*', "");
+        let claim = claim.trim();
+        let expect_ok = match claim {
+            "ok" | "accepted" | "ok (kept)" | "accepted (kept)" => true,
+            "diagnosed" => false,
+            other => panic!("unrecognized claim {other:?} for `{form}` -- add it here"),
+        };
+
+        let src = format!("2024-01-15 balance Assets:C {form}\n");
+        let result = rustledger_parser::parse(&src);
+        assert_eq!(
+            result.errors.is_empty(),
+            expect_ok,
+            "docs say `{form}` is {claim}, but parsing gave {:?}",
+            result.errors,
+        );
+        rows += 1;
+    }
+
+    // A table that stopped being found, or whose format changed, would make
+    // every assertion above vacuous.
+    assert!(
+        rows >= 8,
+        "only {rows} rows recognized in the documented table; the format \
+         probably changed and this test stopped checking anything",
+    );
+}
+
+#[test]
+fn balance_tolerance_accepts_one_reading_and_diagnoses_none() {
+    // beancount's grammar is `NUMBER ~ NUMBER CURRENCY` -- one currency,
+    // trailing -- and it rejects any currency before the `~`. We differ in
+    // both directions on one rule: accept what has exactly one meaning,
+    // diagnose what has none or contradicts itself (#2193).
+    //
+    // Every row below was checked against beancount 3.2.3; the `bc` column
+    // records what it does, so a future reader can see which way each row
+    // diverges and why.
+    let cases: &[(&str, bool, &str)] = &[
+        // form, accepted by us, what beancount does
+        ("1.00 USD", true, "ok"),
+        ("1.00 ~ 0.01 USD", true, "ok"),
+        ("0.25 + 0.75 ~ 0.01 USD", true, "ok"),
+        ("(0.25 + 0.75) ~ 0.01 USD", true, "ok"),
+        ("1.00 ~ 0.005 + 0.005 USD", true, "ok"),
+        ("1.00 ~ 0.005 * 2 USD", true, "ok"),
+        // Laxer than beancount ON PURPOSE: the currency is stated twice and
+        // agrees, so there is one reading, and it canonicalizes to
+        // `1.00 ~ 0.01 USD` losslessly.
+        ("1.00 USD ~ 0.01 USD", true, "syntax error"),
+        ("0.25 + 0.75 USD ~ 0.01 USD", true, "syntax error"),
+        // Stricter than we used to be: these say something unkeepable and
+        // were being read in part and discarded in part.
+        ("1.00 USD ~ 0.01 EUR", false, "syntax error"),
+        ("1.00 ~ 0.001 0.02 USD", false, "syntax error"),
+        ("1.00 ~ 0.01 ~ 0.02 USD", false, "syntax error"),
+        // A `~` announcing a tolerance that is not there. Accepted as though
+        // unwritten, and `rledger format` then deleted the tilde.
+        ("1.00 USD ~", false, "syntax error"),
+        ("1.00 ~ USD", false, "syntax error"),
+    ];
+
+    for (form, accepted, bc) in cases {
+        let src = format!("2024-01-15 balance Assets:C {form}\n");
+        let result = rustledger_parser::parse(&src);
+        assert_eq!(
+            result.errors.is_empty(),
+            *accepted,
+            "`{form}` (beancount: {bc}) -- errors were {:?}",
+            result.errors,
+        );
+    }
+
+    // The accepted redundant form must mean exactly what the canonical one
+    // means, or "one reading" is not true.
+    let redundant = rustledger_parser::parse("2024-01-15 balance Assets:C 1.00 USD ~ 0.01 USD\n");
+    let canonical = rustledger_parser::parse("2024-01-15 balance Assets:C 1.00 ~ 0.01 USD\n");
+    let bal = |r: &rustledger_parser::ParseResult| {
+        r.directives
+            .iter()
+            .find_map(|d| match &d.value {
+                Directive::Balance(b) => Some((b.amount.clone(), b.tolerance)),
+                _ => None,
+            })
+            .expect("a balance")
+    };
+    assert_eq!(
+        bal(&redundant),
+        bal(&canonical),
+        "the redundant spelling must parse to the same amount and tolerance",
+    );
+
+    // Each rejection must be diagnosed for the RIGHT reason. The second
+    // tilde used to fall into the juxtaposed-numbers arm, whose message
+    // says the numbers are "side by side" when a `~` sits between them.
+    let msg_for = |form: &str| {
+        rustledger_parser::parse(&format!("2024-01-15 balance Assets:C {form}\n"))
+            .errors
+            .iter()
+            .find_map(|e| match &e.kind {
+                rustledger_parser::ParseErrorKind::SyntaxError(m) => Some(m.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        msg_for("1.00 USD ~ 0.01 EUR").contains("same currency as the amount"),
+        "currency mismatch must say so: {}",
+        msg_for("1.00 USD ~ 0.01 EUR"),
+    );
+    assert!(
+        msg_for("1.00 ~ 0.001 0.02 USD").contains("Two numbers side by side"),
+        "juxtaposed numbers must say so: {}",
+        msg_for("1.00 ~ 0.001 0.02 USD"),
+    );
+    assert!(
+        msg_for("1.00 USD ~").contains("must be followed by a tolerance"),
+        "a dangling tilde must say so: {}",
+        msg_for("1.00 USD ~"),
+    );
+    assert!(
+        msg_for("1.00 ~ 0.01 ~ 0.02 USD").contains("one tolerance"),
+        "a second tilde must say so, not blame juxtaposed numbers: {}",
+        msg_for("1.00 ~ 0.01 ~ 0.02 USD"),
+    );
+
+    // A malformed tolerance gets the diagnostic that explains it, and not
+    // ours on top. `.005` is a number beancount accepts and our lexer does
+    // not (filed separately); on that input the region is not
+    // expression-shaped, so the juxtaposed-numbers check stays quiet rather
+    // than claiming a second number "was being discarded" from something that
+    // never parsed.
+    let dotted = rustledger_parser::parse("2024-01-15 balance Assets:C 1.00 ~ .005 + .005 USD\n");
+    assert!(
+        !dotted.errors.is_empty(),
+        "fixture must still be rejected for the real reason",
+    );
+    assert!(
+        !dotted.errors.iter().any(|e| matches!(
+            &e.kind,
+            rustledger_parser::ParseErrorKind::SyntaxError(m) if m.contains("Two numbers side by side")
+        )),
+        "must not add a tolerance complaint to input the lexer already refused: {:?}",
+        dotted.errors,
+    );
+
+    // And a tolerance that is arithmetic still evaluates, so the new check
+    // does not catch the multi-number case it is supposed to allow.
+    let arith = rustledger_parser::parse("2024-01-15 balance Assets:C 1.00 ~ 0.005 + 0.005 USD\n");
+    assert_eq!(
+        bal(&arith).1,
+        Some(dec_str("0.010")),
+        "`~ 0.005 + 0.005` must evaluate, not be rejected as two numbers",
+    );
+}
+
 fn dec_str(s: &str) -> rustledger_core::Decimal {
     s.parse().expect("test decimal")
 }

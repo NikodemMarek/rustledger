@@ -878,7 +878,7 @@ fn convert_balance(
         })?;
     let currency = Currency::new(node.currency()?.text());
     let amount = Amount::new(number, currency);
-    let tolerance = extract_balance_tolerance(node.syntax());
+    let tolerance = check_balance_tolerance(node.syntax(), bom_offset, errors);
     let meta = convert_meta_entries(node.syntax());
 
     let balance = rustledger_core::directive::Balance {
@@ -892,35 +892,190 @@ fn convert_balance(
     Some(Spanned::new(Directive::Balance(balance), span))
 }
 
-/// Balance directives may include an explicit tolerance via a
-/// `~` (TILDE) token followed by a NUMBER. The typed-AST surface
-/// surfaces NUMBER via `number()` (which returns the FIRST one,
-/// the asserted balance); the tolerance NUMBER comes second.
-/// Walk raw tokens until TILDE, then collect the next NUMBER.
-fn extract_balance_tolerance(node: &crate::SyntaxNode) -> Option<Decimal> {
-    // Everything after the TILDE, trivia dropped. The tolerance is its own
-    // expression region: `10.00 ~ 0.005 * 2 USD` asserts a tolerance of 0.010.
+/// Diagnose a tolerance clause that says something the model cannot keep.
+///
+/// beancount's grammar is `NUMBER ~ NUMBER CURRENCY` — one currency, trailing —
+/// and rejects any currency before the `~`. We are deliberately laxer in one
+/// direction and stricter in another, on a single rule: **accept what has
+/// exactly one meaning, diagnose what has none or contradicts itself.**
+///
+/// - `1.00 USD ~ 0.01 USD` is ACCEPTED, though beancount calls it a syntax
+///   error. The currency is stated twice and agrees, so there is one reading;
+///   it canonicalizes to `1.00 ~ 0.01 USD` losslessly. Rejecting it would
+///   refuse a file whose meaning is not in doubt.
+/// - `1.00 USD ~ 0.01 EUR` is DIAGNOSED. A tolerance denominated in a
+///   different currency than the amount is not redundancy, it is an
+///   assertion the model has no field for — and `rledger format` used to
+///   erase the EUR from the file on its way past.
+/// - `1.00 ~ 0.001 0.02 USD` is DIAGNOSED. Two juxtaposed numbers with no
+///   operator have no reading at all; this took the first and dropped the
+///   rest silently. (`~ 0.005 + 0.005` is arithmetic and still evaluates.)
+///
+/// Recorded as a deliberate divergence in `docs/reference/compatibility.md`
+/// (#2193).
+fn check_balance_tolerance(
+    node: &crate::SyntaxNode,
+    bom_offset: u32,
+    errors: &mut Vec<crate::ParseError>,
+) -> Option<Decimal> {
+    // Validate AND extract in one walk. Splitting them cost a second full
+    // token scan per `balance`, which measured +5.8% on a 56,000-balance
+    // ledger -- small in a real ledger, where most directives are
+    // transactions, but paid on every balance for nothing.
     //
-    // Taking the first NUMBER instead (as this did) truncated it to 0.005 and
-    // REJECTED files beancount accepts — and the E2002 message printed the
-    // truncated figure, so the diagnostic advertised the bug (#1944). Same
-    // root cause as the cost-spec truncation in #1939: a number-bearing
-    // position that never reached the shared evaluator.
-    let tail: Vec<crate::SyntaxToken> = node
+    // Most balance directives carry no tolerance at all, so answer that
+    // first, from an iterator rather than a Vec.
+    // Answer "is there a tolerance at all" WITHOUT allocating: on a ledger of
+    // balances the overwhelming majority have none, and collecting their
+    // tokens first measured +4% against main, which reached the same answer
+    // through a `skip_while` that left an empty Vec. The collect below now
+    // happens only for the directives that actually carry a `~`.
+    if !node
         .children_with_tokens()
-        .filter_map(rowan::NodeOrToken::into_token)
-        .skip_while(|t| t.kind() != crate::SyntaxKind::TILDE)
-        .skip(1)
-        .filter(|t| !is_trivia_kind(t.kind()))
-        .collect();
-    if tail.is_empty() {
+        .any(|el| el.kind() == crate::SyntaxKind::TILDE)
+    {
         return None;
     }
-    if let Some(value) = cost_region_value(&tail) {
+    let toks: Vec<crate::SyntaxToken> = node
+        .children_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+        .filter(|t| !is_trivia_kind(t.kind()))
+        .collect();
+    let tilde = toks
+        .iter()
+        .position(|t| t.kind() == crate::SyntaxKind::TILDE)?;
+    let (head, tail) = toks.split_at(tilde);
+    let tail = &tail[1..];
+
+    let currency_of = |ts: &[crate::SyntaxToken]| {
+        ts.iter()
+            .find(|t| t.kind() == crate::SyntaxKind::CURRENCY)
+            .cloned()
+    };
+    if let (Some(before), Some(after)) = (currency_of(head), currency_of(tail))
+        && before.text() != after.text()
+    {
+        let range = after.text_range();
+        let start: u32 = range.start().into();
+        let end: u32 = range.end().into();
+        errors.push(crate::ParseError::new(
+            crate::ParseErrorKind::SyntaxError(format!(
+                "a balance tolerance must be in the same currency as the amount: \
+                 the amount is {} and the tolerance is {}. Drop the second \
+                 currency, or correct it",
+                before.text(),
+                after.text(),
+            )),
+            Span::new((start + bom_offset) as usize, (end + bom_offset) as usize),
+        ));
+    }
+
+    // A second `~` is its own mistake and deserves its own sentence. Without
+    // this it fell into the juxtaposed-numbers arm below, whose message says
+    // the numbers are "side by side" when a tilde sits between them --
+    // a diagnostic describing input the author did not write.
+    if let Some(extra) = tail.iter().find(|t| t.kind() == crate::SyntaxKind::TILDE) {
+        let range = extra.text_range();
+        let start: u32 = range.start().into();
+        let end: u32 = range.end().into();
+        errors.push(crate::ParseError::new(
+            crate::ParseErrorKind::SyntaxError(
+                "a balance takes one tolerance: `AMOUNT ~ TOLERANCE CURRENCY`".to_string(),
+            ),
+            Span::new((start + bom_offset) as usize, (end + bom_offset) as usize),
+        ));
+        return None;
+    }
+
+    // Numbers in the tolerance region, i.e. before its trailing CURRENCY.
+    // Sliced out of `tail` rather than collected: `cost_region_value` takes
+    // the same `&[SyntaxToken]`, so the two Vecs this used to build (one of
+    // references, one cloning every token back out) bought nothing.
+    let end = tail
+        .iter()
+        .position(|t| t.kind() == crate::SyntaxKind::CURRENCY)
+        .unwrap_or(tail.len());
+    let region = &tail[..end];
+    let numbers = region
+        .iter()
+        .filter(|t| t.kind() == crate::SyntaxKind::NUMBER)
+        .count();
+
+    // A `~` with nothing after it announces a tolerance that is not there.
+    // It was accepted as though unwritten, and `rledger format` then deleted
+    // the tilde -- the same erase-the-difference behavior as the mismatched
+    // currency. beancount calls it a syntax error.
+    if numbers == 0 {
+        let range = toks[tilde].text_range();
+        let start: u32 = range.start().into();
+        let end: u32 = range.end().into();
+        errors.push(crate::ParseError::new(
+            crate::ParseErrorKind::SyntaxError(
+                "a `~` must be followed by a tolerance: `AMOUNT ~ TOLERANCE CURRENCY`".to_string(),
+            ),
+            Span::new((start + bom_offset) as usize, (end + bom_offset) as usize),
+        ));
+        return None;
+    }
+    // Stay quiet unless the region is made only of things an expression can
+    // contain. On `~ .005 + .005` the lexer already reports the real problem
+    // (a number with no integer part, which we reject and beancount accepts)
+    // and this would add "the second was being discarded" on top -- a claim
+    // about input that never parsed, next to the diagnostic that explains it.
+    let expression_shaped = region.iter().all(|t| {
+        matches!(
+            t.kind(),
+            crate::SyntaxKind::NUMBER
+                | crate::SyntaxKind::PLUS
+                | crate::SyntaxKind::MINUS
+                | crate::SyntaxKind::STAR
+                | crate::SyntaxKind::SLASH
+                | crate::SyntaxKind::L_PAREN
+                | crate::SyntaxKind::R_PAREN
+        )
+    });
+    if expression_shaped
+        && numbers > 1
+        && cost_region_value(region).is_none()
+        && let Some(second) = region
+            .iter()
+            .filter(|t| t.kind() == crate::SyntaxKind::NUMBER)
+            .nth(1)
+    {
+        let range = second.text_range();
+        let start: u32 = range.start().into();
+        let end: u32 = range.end().into();
+        errors.push(crate::ParseError::new(
+            crate::ParseErrorKind::SyntaxError(
+                "a balance tolerance takes one number, or an arithmetic \
+                 expression. Two numbers side by side have no reading, and the \
+                 second was being discarded"
+                    .to_string(),
+            ),
+            Span::new((start + bom_offset) as usize, (end + bom_offset) as usize),
+        ));
+    }
+
+    tolerance_value(region)
+}
+
+/// Evaluate a tolerance region: an expression when it is one, else its first
+/// NUMBER.
+///
+/// `10.00 ~ 0.005 * 2 USD` asserts a tolerance of 0.010. Taking the first
+/// NUMBER instead truncated it to 0.005 and REJECTED files beancount accepts
+/// -- and the E2002 message printed the truncated figure, so the diagnostic
+/// advertised the bug (#1944). Same root cause as the cost-spec truncation in
+/// #1939: a number-bearing position that never reached the shared evaluator.
+fn tolerance_value(region: &[crate::SyntaxToken]) -> Option<Decimal> {
+    if region.is_empty() {
+        return None;
+    }
+    if let Some(value) = cost_region_value(region) {
         return Some(value);
     }
-    // Not arithmetic: the plain first NUMBER, as before.
-    tail.iter()
+    region
+        .iter()
         .find(|t| t.kind() == crate::SyntaxKind::NUMBER)
         .and_then(|t| parse_decimal_token(t.text()))
 }
