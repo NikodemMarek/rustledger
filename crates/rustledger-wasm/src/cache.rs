@@ -96,7 +96,14 @@ use crate::types::{Error, LedgerOptions};
 /// outright (#2191). Loader v33. Parser OUTPUT in both directions: a v17 blob
 /// holds a parse error where this build produces a balance, and a truncated
 /// 1.10 where this build produces an error.
-pub const CACHE_VERSION: u32 = 18;
+/// v19: a `query` carrying a tag or link is diagnosed (#2194). Loader v34.
+/// The archived DIRECTIVE is identical -- `reject_tags_and_links` records an
+/// error and conversion still emits the `Query` -- so what a stale blob costs
+/// is the diagnostic, not the data: such a file used to parse clean and was
+/// therefore cacheable, and replaying its blob skips the parse that now
+/// complains. Verified against a pre-#2194 binary's cache: 0 errors without
+/// this bump, 2 with it.
+pub const CACHE_VERSION: u32 = 19;
 
 /// The `rustledger-loader` cache version this one was last reconciled with.
 ///
@@ -128,7 +135,7 @@ pub const CACHE_VERSION: u32 = 18;
 /// than in the test module so a reader of this file meets the contract next
 /// to `CACHE_VERSION`, which is the thing they came to change.
 #[cfg(test)]
-const LOADER_CACHE_VERSION_PIN: u32 = 33;
+const LOADER_CACHE_VERSION_PIN: u32 = 34;
 
 /// Magic bytes for [`ParsedLedgerPayload`] cache blobs.
 pub const MAGIC_PARSED: &[u8; 8] = b"WLPARSED";
