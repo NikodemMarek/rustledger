@@ -1289,6 +1289,94 @@ mod tests {
     }
 
     #[test]
+    fn test_directive_wrapper_ignores_filename_and_lineno_in_partial_eq() {
+        let dir_a = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: Some("file_a.beancount".to_string()),
+            lineno: Some(10),
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["USD".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+
+        let dir_b = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: Some("file_b.beancount".to_string()),
+            lineno: Some(999),
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["USD".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+
+        let dir_none = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: None,
+            lineno: None,
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["USD".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+
+        assert_eq!(dir_a, dir_b);
+        assert_eq!(dir_a, dir_none);
+    }
+
+    #[test]
+    fn test_partial_eq_both_directions() {
+        let dir1 = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: Some("main.beancount".to_string()),
+            lineno: Some(10),
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["USD".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+        let dir2 = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: Some("other.beancount".to_string()),
+            lineno: Some(20),
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["USD".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+        let dir3 = DirectiveWrapper {
+            directive_type: "transaction".to_string(),
+            date: "2024-01-01".to_string(),
+            filename: Some("main.beancount".to_string()),
+            lineno: Some(10),
+            data: DirectiveData::Open(OpenData {
+                account: "Assets:Bank".to_string(),
+                currencies: vec!["EUR".to_string()],
+                booking: None,
+                metadata: vec![],
+            }),
+        };
+
+        assert_eq!(dir1, dir2);
+        assert_ne!(dir1, dir3);
+    }
+
+    #[test]
     fn test_plugin_error_builder() {
         let error = PluginError::error("test error").at("file.beancount", 10);
         assert_eq!(error.message, "test error");
