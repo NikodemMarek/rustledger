@@ -467,8 +467,7 @@ impl PluginError {
 ///
 /// This wrapper provides a uniform interface for all directive types,
 /// with source location tracking for error reporting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectiveWrapper {
     /// The type of directive (derived from data, not serialized to avoid duplicate keys).
     #[serde(skip_serializing, default)]
@@ -524,8 +523,7 @@ impl DirectiveWrapper {
 /// Directive-specific data.
 ///
 /// Each variant corresponds to a Beancount directive type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DirectiveData {
     /// Transaction data.
@@ -571,8 +569,7 @@ pub enum DirectiveData {
 // ============================================================================
 
 /// Transaction data for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionData {
     /// Transaction flag (`*` for complete, `!` for incomplete/pending).
     pub flag: String,
@@ -615,8 +612,7 @@ pub struct SourceSpan {
 }
 
 /// Posting data for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostingData {
     /// Account name (e.g., `Assets:Bank:Checking`).
     pub account: String,
@@ -639,8 +635,7 @@ pub struct PostingData {
 }
 
 /// Amount data for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmountData {
     /// Number as string (preserves precision).
     pub number: String,
@@ -670,8 +665,7 @@ pub struct AmountData {
 /// "per_unit_from_total", "per_unit": "150", "total": "300"}` — the
 /// `kind`-tagged shape is shared with FFI-WASI, WASM, and Python so
 /// every client language sees one wire contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CostNumberData {
     /// Per-unit cost: `{150.00 USD}`.
@@ -740,8 +734,7 @@ impl CostNumberData {
 /// Cost data for serialization.
 ///
 /// Represents cost specifications like `{100 USD}` or `{100 USD, 2024-01-01, "lot1"}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostData {
     /// The numeric component: per-unit, total, or absent (e.g. `{}`).
     ///
@@ -783,8 +776,7 @@ pub struct CostData {
 /// originally because nothing forced consumers to read the bool. The
 /// `view()` enum closes that loop: a missing match arm is a compile
 /// error.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceAnnotationData {
     /// Whether this is a total price (`@@`) vs per-unit (`@`).
     ///
@@ -871,9 +863,8 @@ impl PriceAnnotationData {
 ///
 /// Metadata can hold various types of values, preserving type information
 /// for accurate round-tripping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum MetaValueData {
     /// String value.
     #[serde(rename = "string")]
@@ -909,8 +900,7 @@ pub enum MetaValueData {
 // ============================================================================
 
 /// Balance assertion data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BalanceData {
     /// Account name.
     pub account: String,
@@ -924,8 +914,7 @@ pub struct BalanceData {
 }
 
 /// Open account data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenData {
     /// Account name.
     pub account: String,
@@ -939,8 +928,7 @@ pub struct OpenData {
 }
 
 /// Close account data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseData {
     /// Account name.
     pub account: String,
@@ -950,8 +938,7 @@ pub struct CloseData {
 }
 
 /// Commodity declaration data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommodityData {
     /// Currency code.
     pub currency: String,
@@ -961,8 +948,7 @@ pub struct CommodityData {
 }
 
 /// Pad directive data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadData {
     /// Account to pad.
     pub account: String,
@@ -974,8 +960,7 @@ pub struct PadData {
 }
 
 /// Event data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventData {
     /// Event type.
     pub event_type: String,
@@ -987,8 +972,7 @@ pub struct EventData {
 }
 
 /// Note data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteData {
     /// Account name.
     pub account: String,
@@ -1000,8 +984,7 @@ pub struct NoteData {
 }
 
 /// Document data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentData {
     /// Account name.
     pub account: String,
@@ -1021,8 +1004,7 @@ pub struct DocumentData {
 }
 
 /// Price directive data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceData {
     /// Currency being priced.
     pub currency: String,
@@ -1034,8 +1016,7 @@ pub struct PriceData {
 }
 
 /// Query directive data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryData {
     /// Query name.
     pub name: String,
@@ -1047,8 +1028,7 @@ pub struct QueryData {
 }
 
 /// Custom directive data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomData {
     /// Custom type (first value after `custom` keyword).
     pub custom_type: String,
