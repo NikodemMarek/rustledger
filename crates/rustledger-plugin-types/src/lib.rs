@@ -467,7 +467,7 @@ impl PluginError {
 ///
 /// This wrapper provides a uniform interface for all directive types,
 /// with source location tracking for error reporting.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct DirectiveWrapper {
     /// The type of directive (derived from data, not serialized to avoid duplicate keys).
     #[serde(skip_serializing, default)]
@@ -476,15 +476,25 @@ pub struct DirectiveWrapper {
     pub date: String,
     /// Source filename (for tracking through plugin processing).
     /// If None, the directive was created by a plugin.
+    /// Will not be compared during equality check.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filename: Option<String>,
     /// Source line number (1-based).
     /// If None, the directive was created by a plugin.
+    /// Will not be compared during equality check.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineno: Option<u32>,
     /// Directive-specific data as a nested structure.
     #[serde(flatten)]
     pub data: DirectiveData,
+}
+
+impl PartialEq for DirectiveWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.directive_type == other.directive_type
+            && self.date == other.date
+            && self.data == other.data
+    }
 }
 
 impl DirectiveWrapper {
