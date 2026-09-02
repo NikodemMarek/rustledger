@@ -467,6 +467,12 @@ impl PluginError {
 ///
 /// This wrapper provides a uniform interface for all directive types,
 /// with source location tracking for error reporting.
+///
+/// # Equality and Hashing Note
+/// The custom [`PartialEq`] implementation skips `directive_type`, `filename`, and `lineno`
+/// (location metadata and derived fields). If [`std::hash::Hash`] is ever implemented for
+/// `DirectiveWrapper`, those fields must also be excluded to satisfy the `Hash`/`Eq` invariant
+/// (`a == b => hash(a) == hash(b)`).
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct DirectiveWrapper {
     /// The type of directive (derived from data, not serialized to avoid duplicate keys).
@@ -490,9 +496,6 @@ pub struct DirectiveWrapper {
     pub data: DirectiveData,
 }
 
-// Skips `directive_type`, `filename`, and `lineno` (location metadata and derived field).
-// If `Hash` is ever implemented for `DirectiveWrapper`, those fields must also be excluded
-// to preserve the `Hash`/`Eq` invariant (`a == b => hash(a) == hash(b)`).
 impl PartialEq for DirectiveWrapper {
     fn eq(
         &self,
@@ -633,6 +636,11 @@ pub struct SourceSpan {
 }
 
 /// Posting data for serialization.
+///
+/// # Equality and Hashing Note
+/// The custom [`PartialEq`] implementation skips `span` (location metadata).
+/// If [`std::hash::Hash`] is ever implemented for `PostingData`, `span` must also be
+/// excluded to satisfy the `Hash`/`Eq` invariant (`a == b => hash(a) == hash(b)`).
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct PostingData {
     /// Account name (e.g., `Assets:Bank:Checking`).
@@ -656,9 +664,6 @@ pub struct PostingData {
     pub span: Option<SourceSpan>,
 }
 
-// Skips `span` (location metadata).
-// If `Hash` is ever implemented for `PostingData`, `span` must also be excluded
-// to preserve the `Hash`/`Eq` invariant (`a == b => hash(a) == hash(b)`).
 impl PartialEq for PostingData {
     fn eq(
         &self,
