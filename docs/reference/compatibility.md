@@ -184,6 +184,159 @@ a label) rather than relying on either tiebreak.
 Fixture: `tests/fixtures/cross-file-order/`. Pinned by
 `cross_file_same_date_directives_keep_include_order` (issue #2149).
 
+### 8. Same-Date Directive Ordering in `#entries`
+
+beancount sorts entries by `(date, type_priority, lineno)`, and its priorities
+put Transaction, Pad, Note, Price, Event, Query, Commodity and Custom in ONE
+bucket, tie-broken by line number. We give each type its own priority, so
+same-date directives group by type rather than interleaving by line.
+
+Visible when a `pad` shares its date with a `note`, `price` or `close`:
+
+```text
+bean-query   balance pad transaction note price close
+rustledger   balance pad note price close transaction
+```
+
+Cosmetic: notes, prices and closes carry no postings, so no balance moves. The
+balance-affecting case -- a pad sharing its date with an unrelated transaction
+-- agrees, and a synthesized padding transaction sits at the end of its date
+group in both tools rather than displacing entries ahead of it.
+
+This is the same type-grouping-versus-`lineno` difference as issue #2149,
+which also covers the cross-file half described in section 7. Pad placement
+specifically is pinned by `pad_insertion_index` and its tests (issue #2188).
+
+### 9. Shorthand Command Column Names
+
+`BALANCES` and `JOURNAL` name their columns differently:
+
+| query | bean-query | rustledger |
+|---|---|---|
+| `BALANCES` | `account, SUM((position))` | `account, balance` |
+| `JOURNAL` | `date, flag, MAXWIDTH(payee, 48), MAXWIDTH(narration, 80), ...` | `date, flag, payee, narration, ...` |
+| `JOURNAL ... AT COST` | `..., cost(position), cost(balance)` | `..., position, balance` |
+
+The rows agree in every case; only the labels differ.
+
+bean-query's names are not chosen. `transform_journal` builds the query by
+parsing a SQL string template whose targets carry no `AS` aliases, so the names
+fall through to the generic "render the expression as its name" path --
+`MAXWIDTH(payee, 48)` is a display-truncation call leaking into a column name,
+and `SUM((position))` carries the doubled parens of its desugared expression.
+Ours are what the template meant.
+
+Keeping ours on purpose: matching would mean printing an implementation detail
+of bean-query's query compiler as a user-facing column name. Recorded in
+`KNOWN_HEADER_DIVERGENCES` in `scripts/compat-bql-test.py`, scoped to headers
+so a data regression on the same query is still caught (issue #2221).
+
+Contrast `PIVOT BY`, whose column names bean-query sets in its evaluator and
+exposes through its API -- those are part of the result's structure and we do
+match them (issue #2217).
+
+### 10. Multi-Currency Inventory Rendering
+
+`SELECT account, SUM(position) GROUP BY account` over a multi-currency result:
+
+```text
+bean-query   Assets:CORP," 100 CORP { 1 USD},        "
+             Assets:Cash,"                  ,-100 USD"
+
+rustledger   Assets:CORP,100 CORP { 1 USD}
+             Assets:Cash,-100 USD
+```
+
+bean-query renders one field holding a slot per currency seen anywhere in the
+result, empty slots padded so currencies line up vertically. That is its
+`InventoryRenderer` doing table layout -- its API returns a plain `Inventory`
+(`(100 CORP {1 USD})`), with no slots and no padding, which is what we emit.
+
+The values agree. Reproducing the slots would mean carrying a column-alignment
+artifact into a machine-readable format, where the padding has nothing to align
+(issue #2222).
+
+### 11. PIVOT BY, ORDER BY and LIMIT
+
+`ORDER BY` and `LIMIT` apply to the PIVOTED rows here; bean-query applies them
+to the rows going IN to the pivot, and its pivot then re-sorts by the key.
+
+```text
+... GROUP BY account, year ORDER BY account DESC PIVOT BY account, year LIMIT 2
+
+bean-query   Equity:O                  <- one row; DESC not visible
+rustledger   Equity:O, Assets:B        <- two rows, in the requested order
+```
+
+Two consequences of bean-query's order: an explicit `ORDER BY` never reaches
+the output, and `LIMIT` can change the result's SHAPE — limiting the rows going
+in can leave a pivot value unrepresented, so a column disappears. `LIMIT 2` on
+the query above with no `ORDER BY` drops the 2025 column entirely.
+
+These are one decision, not two. bean-query's `ORDER BY` loss is an artifact
+rather than a policy: `EvalPivot.__call__` sorts rows by the key column
+immediately before `itertools.groupby`, which only groups ADJACENT equal keys,
+so the sort is a precondition of grouping and discards the requested order as a
+side effect. Nothing upstream tests `PIVOT BY` with either clause. Its `LIMIT`
+behavior is coherent under its own model — pivot as a display reshape over a
+finished query — but that model is what discards `ORDER BY`. Once the requested
+order is honored on the pivoted rows, `LIMIT` has to count those same rows:
+ordering one row set and limiting a different one would be incoherent.
+
+So matching bean-query here is a package deal that includes silently ignoring
+an explicit clause. Pinned by
+`crates/rustledger-query/tests/pivot_pipeline_order_test.rs` (issue #2219).
+
+### 12. SUM Over a Boolean
+
+`sum(number > 0)` counts the rows where the comparison is true. Python sums
+booleans as integers, so bean-query computes the same number -- but prints it
+as `TRUE`:
+
+```
+$ bean-query -f csv f.bean "SELECT sum(number > 0) FROM #postings"
+TRUE
+
+$ rledger query -f csv f.bean "SELECT sum(number > 0) FROM #postings"
+2
+```
+
+The values agree; only the rendering differs. bean-query types the result
+column from its argument, so the integer it computed is formatted through the
+boolean formatter. Through its API the number is visible:
+
+```python
+conn.execute("SELECT sum(number > 0) FROM #postings").fetchall()
+# [(2,)]
+```
+
+We print the value. Reproducing `TRUE` would mean reproducing a display bug,
+and `2` is what a user asking "how many postings are positive" means.
+
+`count(number > 0)` answers a different question -- it counts non-NULL
+comparisons, so on the same data it is 4, in both tools.
+
+Pinned by `crates/rustledger-query/tests/sum_over_booleans_test.rs` (issue
+#2214).
+
+### 13. Comparisons Against a Missing Value
+
+A comparison with a NULL operand is NULL, in both tools. On a posting whose
+transaction has no payee, `payee != ''`, `payee ~ 'x'` and `payee IN ('a')` are
+each NULL rather than a boolean, so `count(payee != '')` is 0 and not the row
+count.
+
+This is agreement, not divergence, and is listed here because it is easy to
+assume the opposite: `WHERE payee != ''` still filters those rows out, since
+NULL is falsy. Only projecting or counting a comparison shows the difference.
+
+`NOT (NULL)` is `TRUE` -- Python's rule, which beanquery follows, rather than
+SQL three-valued logic. An empty collection is not NULL: `'food' IN tags` on an
+untagged posting is `FALSE`, again in both tools.
+
+Pinned by `crates/rustledger-query/tests/null_comparison_test.rs` (issue
+#2213).
+
 ## BQL Query Compatibility
 
 BQL (Beancount Query Language) compatibility was tested with 11 standard queries on 50 files:
