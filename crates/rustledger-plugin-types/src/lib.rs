@@ -470,6 +470,7 @@ impl PluginError {
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct DirectiveWrapper {
     /// The type of directive (derived from data, not serialized to avoid duplicate keys).
+    /// Will not be compared during equality check.
     #[serde(skip_serializing, default)]
     pub directive_type: String,
     /// The directive date (YYYY-MM-DD format).
@@ -491,9 +492,7 @@ pub struct DirectiveWrapper {
 
 impl PartialEq for DirectiveWrapper {
     fn eq(&self, other: &Self) -> bool {
-        self.directive_type == other.directive_type
-            && self.date == other.date
-            && self.data == other.data
+        self.date == other.date && self.data == other.data
     }
 }
 
@@ -622,7 +621,7 @@ pub struct SourceSpan {
 }
 
 /// Posting data for serialization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct PostingData {
     /// Account name (e.g., `Assets:Bank:Checking`).
     pub account: String,
@@ -640,8 +639,20 @@ pub struct PostingData {
     /// from, if any. Plugins **must preserve** this unchanged when
     /// modifying an existing posting; set to `None` only for postings
     /// the plugin itself synthesizes. See [`SourceSpan`] for details.
+    /// Will not be compared during equality check.
     #[serde(default)]
     pub span: Option<SourceSpan>,
+}
+
+impl PartialEq for PostingData {
+    fn eq(&self, other: &Self) -> bool {
+        self.account == other.account
+            && self.units == other.units
+            && self.cost == other.cost
+            && self.price == other.price
+            && self.flag == other.flag
+            && self.metadata == other.metadata
+    }
 }
 
 /// Amount data for serialization.
@@ -1289,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_directive_wrapper_ignores_filename_and_lineno_in_partial_eq() {
+    fn test_directive_wrapper_ignores_directive_type_filename_and_lineno_in_partial_eq() {
         let dir_a = DirectiveWrapper {
             directive_type: "transaction".to_string(),
             date: "2024-01-01".to_string(),
@@ -1304,7 +1315,7 @@ mod tests {
         };
 
         let dir_b = DirectiveWrapper {
-            directive_type: "transaction".to_string(),
+            directive_type: "open".to_string(),
             date: "2024-01-01".to_string(),
             filename: Some("file_b.beancount".to_string()),
             lineno: Some(999),
@@ -1331,6 +1342,78 @@ mod tests {
 
         assert_eq!(dir_a, dir_b);
         assert_eq!(dir_a, dir_none);
+    }
+
+    #[test]
+    fn test_posting_data_ignores_span_in_partial_eq() {
+        let span_a = SourceSpan {
+            start: 10,
+            end: 50,
+            file_id: 1,
+        };
+        let span_b = SourceSpan {
+            start: 100,
+            end: 200,
+            file_id: 2,
+        };
+
+        let posting_a = PostingData {
+            account: "Expenses:Food".to_string(),
+            units: Some(AmountData {
+                number: "12.50".to_string(),
+                currency: "USD".to_string(),
+            }),
+            cost: None,
+            price: None,
+            flag: None,
+            metadata: vec![],
+            span: Some(span_a),
+        };
+
+        let posting_b = PostingData {
+            account: "Expenses:Food".to_string(),
+            units: Some(AmountData {
+                number: "12.50".to_string(),
+                currency: "USD".to_string(),
+            }),
+            cost: None,
+            price: None,
+            flag: None,
+            metadata: vec![],
+            span: Some(span_b),
+        };
+
+        let posting_none = PostingData {
+            account: "Expenses:Food".to_string(),
+            units: Some(AmountData {
+                number: "12.50".to_string(),
+                currency: "USD".to_string(),
+            }),
+            cost: None,
+            price: None,
+            flag: None,
+            metadata: vec![],
+            span: None,
+        };
+
+        // Postings with different or missing spans must compare equal
+        assert_eq!(posting_a, posting_b, "different spans must compare equal");
+        assert_eq!(posting_a, posting_none, "Some vs None span must compare equal");
+
+        // Differing in an actual field (e.g. account) must compare not equal
+        let posting_diff = PostingData {
+            account: "Expenses:Groceries".to_string(),
+            units: Some(AmountData {
+                number: "12.50".to_string(),
+                currency: "USD".to_string(),
+            }),
+            cost: None,
+            price: None,
+            flag: None,
+            metadata: vec![],
+            span: Some(span_a),
+        };
+        assert_ne!(posting_a, posting_diff, "differing in account must compare not equal");
     }
 
     #[test]
