@@ -490,6 +490,9 @@ pub struct DirectiveWrapper {
     pub data: DirectiveData,
 }
 
+// Skips `directive_type`, `filename`, and `lineno` (location metadata and derived field).
+// If `Hash` is ever implemented for `DirectiveWrapper`, those fields must also be excluded
+// to preserve the `Hash`/`Eq` invariant (`a == b => hash(a) == hash(b)`).
 impl PartialEq for DirectiveWrapper {
     fn eq(
         &self,
@@ -653,6 +656,9 @@ pub struct PostingData {
     pub span: Option<SourceSpan>,
 }
 
+// Skips `span` (location metadata).
+// If `Hash` is ever implemented for `PostingData`, `span` must also be excluded
+// to preserve the `Hash`/`Eq` invariant (`a == b => hash(a) == hash(b)`).
 impl PartialEq for PostingData {
     fn eq(
         &self,
