@@ -491,8 +491,17 @@ pub struct DirectiveWrapper {
 }
 
 impl PartialEq for DirectiveWrapper {
-    fn eq(&self, other: &Self) -> bool {
-        self.date == other.date && self.data == other.data
+    fn eq(
+        &self,
+        Self {
+            directive_type: _,
+            date,
+            filename: _,
+            lineno: _,
+            data,
+        }: &Self,
+    ) -> bool {
+        self.date == *date && self.data == *data
     }
 }
 
@@ -645,13 +654,24 @@ pub struct PostingData {
 }
 
 impl PartialEq for PostingData {
-    fn eq(&self, other: &Self) -> bool {
-        self.account == other.account
-            && self.units == other.units
-            && self.cost == other.cost
-            && self.price == other.price
-            && self.flag == other.flag
-            && self.metadata == other.metadata
+    fn eq(
+        &self,
+        Self {
+            account,
+            units,
+            cost,
+            price,
+            flag,
+            metadata,
+            span: _,
+        }: &Self,
+    ) -> bool {
+        self.account == *account
+            && self.units == *units
+            && self.cost == *cost
+            && self.price == *price
+            && self.flag == *flag
+            && self.metadata == *metadata
     }
 }
 
@@ -1398,7 +1418,10 @@ mod tests {
 
         // Postings with different or missing spans must compare equal
         assert_eq!(posting_a, posting_b, "different spans must compare equal");
-        assert_eq!(posting_a, posting_none, "Some vs None span must compare equal");
+        assert_eq!(
+            posting_a, posting_none,
+            "Some vs None span must compare equal"
+        );
 
         // Differing in an actual field (e.g. account) must compare not equal
         let posting_diff = PostingData {
@@ -1413,13 +1436,16 @@ mod tests {
             metadata: vec![],
             span: Some(span_a),
         };
-        assert_ne!(posting_a, posting_diff, "differing in account must compare not equal");
+        assert_ne!(
+            posting_a, posting_diff,
+            "differing in account must compare not equal"
+        );
     }
 
     #[test]
     fn test_partial_eq_both_directions() {
         let dir1 = DirectiveWrapper {
-            directive_type: "transaction".to_string(),
+            directive_type: "open".to_string(),
             date: "2024-01-01".to_string(),
             filename: Some("main.beancount".to_string()),
             lineno: Some(10),
@@ -1431,6 +1457,7 @@ mod tests {
             }),
         };
         let dir2 = DirectiveWrapper {
+            // Incorrect, to verify the PartialEq behavior.
             directive_type: "transaction".to_string(),
             date: "2024-01-01".to_string(),
             filename: Some("other.beancount".to_string()),
@@ -1443,7 +1470,7 @@ mod tests {
             }),
         };
         let dir3 = DirectiveWrapper {
-            directive_type: "transaction".to_string(),
+            directive_type: "open".to_string(),
             date: "2024-01-01".to_string(),
             filename: Some("main.beancount".to_string()),
             lineno: Some(10),
