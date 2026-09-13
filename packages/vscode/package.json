@@ -2,7 +2,7 @@
   "name": "rustledger-vscode",
   "publisher": "rustledger",
   "displayName": "rustledger",
-  "description": "Beancount language support powered by rustledger — completions, diagnostics, formatting, and more",
+  "description": "Beancount language support powered by rustledger \u2014 completions, diagnostics, formatting, and more",
   "version": "0.1.0",
   "license": "GPL-3.0-only",
   "repository": {
@@ -84,21 +84,46 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically check for extension updates on startup"
+        },
+        "rustledger.amountColors": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show a color swatch beside each amount indicating its sign. The swatch occupies a character cell, so it shifts colored lines relative to uncolored ones and can disturb the alignment `rledger format` produces. Turning this off keeps the sign indication, which is also carried by the `negative` semantic-token modifier."
         }
       }
-    }
+    },
+    "semanticTokenModifiers": [
+      {
+        "id": "negative",
+        "description": "A negative amount. Custom: LSP defines no standard modifier for sign."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "beancount",
+        "scopes": {
+          "number.negative": [
+            "constant.numeric.negative.beancount",
+            "markup.deleted",
+            "constant.numeric"
+          ]
+        }
+      }
+    ]
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --watch",
-    "package": "npm run build && vsce package --no-dependencies -o rustledger-vscode.vsix"
+    "package": "npm run build && vsce package --no-dependencies -o rustledger-vscode.vsix",
+    "test": "esbuild src/extension.ts --bundle --outfile=out/extension.test.cjs --external:vscode --external:vscode-languageclient/node --format=cjs --platform=node && node --test test/*.test.cjs"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.1.0"
+    "vscode-languageclient": "^10.1.1"
   },
   "devDependencies": {
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.4.1",
     "@types/vscode": "1.91.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.2",
@@ -106,7 +131,7 @@
   },
   "overrides": {
     "uuid": "^14.0.0",
-    "fast-uri": "^3.1.5",
+    "fast-uri": "^3.1.7",
     "linkify-it": "^5.0.2",
     "js-yaml": "^4.3.1"
   }

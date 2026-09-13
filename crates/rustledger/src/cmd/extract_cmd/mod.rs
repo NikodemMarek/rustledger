@@ -57,6 +57,7 @@
 
 mod config;
 mod duplicate;
+mod ledger_profile;
 mod suggest;
 
 use crate::cmd::completions::ShellType;
@@ -72,7 +73,11 @@ use config::expand_tilde;
 use duplicate::load_existing_transactions;
 use rustledger_core::{Directive, FormatConfig};
 use rustledger_importer::config::CsvConfigBuilder;
-use rustledger_importer::{Importer, ImporterConfig, ImporterRegistry, csv_importer::CsvImporter};
+use rustledger_importer::toml_entry::EntryFormat;
+use rustledger_importer::{
+    Importer, ImporterConfig, ImporterRegistry, csv_importer::CsvImporter,
+    ofx_importer::OfxImporter,
+};
 use rustledger_parser::format::canonicalize_directives;
 use std::fs;
 use std::io::{self, Write};
@@ -105,8 +110,16 @@ pub struct Args {
     pub list_importers: bool,
 
     /// Target account for imported transactions
-    #[arg(short, long, default_value = "Assets:Bank:Checking")]
-    pub account: String,
+    ///
+    /// `None` means the user did not name one, which is genuinely different
+    /// from naming the default account string: only the former lets extract
+    /// refuse an unconfigured credit-card import (#2256). Read it through
+    /// `Args::account_or_default`, which applies the default.
+    ///
+    /// (Both of those are private, so they are named in prose rather than
+    /// linked: a public item cannot intra-doc-link a private one.)
+    #[arg(short, long)]
+    pub account: Option<String>,
 
     /// Currency for amounts (default: USD)
     #[arg(short, long, default_value = "USD")]
@@ -194,9 +207,25 @@ pub struct Args {
     #[arg(short, long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
+    /// Overwrite `--output` even when it already has content. Without this,
+    /// extract refuses to truncate a non-empty file, because doing so destroys
+    /// whatever is already there (previous imports, hand-written narrations,
+    /// metadata, manual categorization).
+    #[arg(long)]
+    pub force: bool,
+
     /// Existing ledger file for duplicate detection
     #[arg(long, value_name = "FILE")]
     pub existing: Option<PathBuf>,
+
+    /// Read importer profiles from a ledger's `open` directives (#2257).
+    ///
+    /// An account that declares `importer:` and `importer-pattern:` supplies
+    /// the target account — and its currency, when it opens with exactly one —
+    /// so they need not be repeated in `importers.toml`. Separate from
+    /// `--existing`, which is only about duplicate detection.
+    #[arg(long, value_name = "FILE")]
+    pub ledger: Option<PathBuf>,
 
     /// Use ML to suggest accounts for transactions the rules engine didn't
     /// categorize. Trains a Naive Bayes model on the `--existing` ledger and
@@ -318,8 +347,18 @@ fn resolve_config_entry<'a>(
     importers_file: &'a ImportersFile,
     filename: &str,
 ) -> Result<Option<&'a rustledger_importer::toml_entry::ImporterEntry>> {
-    if let Some(ref name) = args.importer {
-        return Ok(importers_file.importers.iter().find(|e| e.name == *name));
+    resolve_config_entry_named(args.importer.as_deref(), importers_file, filename)
+}
+
+/// As [`resolve_config_entry`], but with the entry name supplied explicitly so
+/// a `--ledger` profile can name one (#2257) without forging an `Args`.
+fn resolve_config_entry_named<'a>(
+    importer_name: Option<&str>,
+    importers_file: &'a ImportersFile,
+    filename: &str,
+) -> Result<Option<&'a rustledger_importer::toml_entry::ImporterEntry>> {
+    if let Some(name) = importer_name {
+        return Ok(importers_file.importers.iter().find(|e| e.name == name));
     }
     if importers_file.importers.is_empty() {
         return Ok(None);
@@ -586,6 +625,110 @@ fn maybe_preprocess(args: &Args, file: &Path) -> Result<Option<tempfile::NamedTe
     Ok(Some(tmp))
 }
 
+/// The account used when nothing else supplies one.
+///
+/// Applied by `Args::account_or_default` rather than by clap, so that an
+/// unset `--account` stays `None` and is distinguishable from one set to this
+/// same string. It is an `Assets:` account, which is what makes an
+/// unconfigured credit-card import wrong (#2256).
+const DEFAULT_ACCOUNT: &str = "Assets:Bank:Checking";
+
+impl Args {
+    /// The account to post to when nothing else supplies one.
+    fn account_or_default(&self) -> String {
+        self.account
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ACCOUNT.to_string())
+    }
+}
+
+/// The fields a non-CSV dispatcher can take from an `importers.toml` entry.
+///
+/// Deliberately not the whole `ImporterEntry`: the column-mapping fields
+/// describe delimited text and mean nothing to a self-describing format, so
+/// carrying them here would invite using them.
+struct MinimalEntry {
+    format: Option<String>,
+    account: Option<String>,
+    currency: Option<String>,
+}
+
+/// Resolve the entry that applies to this file, if a config exists at all.
+///
+/// `Ok(None)` covers the ordinary "no config, or nothing in it applies" case.
+/// An `Err` means the config exists and is broken or ambiguous.
+fn load_minimal_entry(
+    args: &Args,
+    file: &Path,
+    importer_name: Option<&str>,
+) -> Result<Option<MinimalEntry>> {
+    let Some(config_path) = find_importers_config(args.config.as_deref())? else {
+        return Ok(None);
+    };
+    let importers_file = load_importers_config(&config_path)?;
+    let filename = file
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    let Some(entry) = resolve_config_entry_named(
+        importer_name.or(args.importer.as_deref()),
+        &importers_file,
+        filename,
+    )?
+    else {
+        return Ok(None);
+    };
+    // Surface an unrecognized `type` here rather than treating it as CSV.
+    entry.entry_format()?;
+    Ok(Some(MinimalEntry {
+        format: entry.format.clone(),
+        account: entry.account.clone(),
+        currency: entry.currency.clone(),
+    }))
+}
+
+/// Entry lookup for the dispatch decision. Silent on failure by design: this
+/// runs before we know whether the config will be used at all, and a path that
+/// would never read one must not be failed by it.
+fn resolve_entry_for_dispatch(
+    args: &Args,
+    file: &Path,
+    profile_entry_name: Option<&str>,
+) -> Option<MinimalEntry> {
+    load_minimal_entry(args, file, profile_entry_name)
+        .ok()
+        .flatten()
+}
+
+/// Entry lookup for the non-CSV config branch.
+///
+/// Warns rather than fails. WASM importers share this branch, and erroring
+/// would fail a `--wasm-importer` run whose config simply has no entry
+/// matching the file — something that worked before #2260. Falling back to
+/// the CLI arguments keeps that working, and the warning means the fallback
+/// is visible instead of silent, which was the actual complaint.
+fn entry_for_minimal_config(
+    args: &Args,
+    file: &Path,
+    importer_name: Option<&str>,
+    warn_on_failure: bool,
+) -> Option<MinimalEntry> {
+    match load_minimal_entry(args, file, importer_name) {
+        Ok(entry) => entry,
+        Err(e) => {
+            // Silent when a `--ledger` profile already supplied the account:
+            // saying we fell back to `--account` would simply be untrue.
+            if warn_on_failure {
+                eprintln!(
+                    "warning: could not apply importers.toml ({e}); \
+                     using --account/--currency instead"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Pick the importer for a given file + CLI args.
 ///
 /// - If the user explicitly chose a TOML entry (`--importer <name>`),
@@ -605,14 +748,25 @@ fn maybe_preprocess(args: &Args, file: &Path) -> Result<Option<tempfile::NamedTe
 /// - Fall back to [`CsvImporter`] for unknown extensions (e.g. `.qbo`
 ///   Quicken exports) so users with custom-extension TOML entries
 ///   keep working.
-fn select_importer(registry: &ImporterRegistry, file: &Path, args: &Args) -> Arc<dyn Importer> {
-    if args.importer.is_some() {
-        Arc::new(CsvImporter)
-    } else {
-        registry
-            .identify(file)
-            .unwrap_or_else(|| Arc::new(CsvImporter) as Arc<dyn Importer>)
+fn select_importer(
+    registry: &ImporterRegistry,
+    file: &Path,
+    entry_named: bool,
+    entry_format: Option<EntryFormat>,
+) -> Arc<dyn Importer> {
+    if entry_named {
+        // `--importer` used to force CSV unconditionally, so naming an OFX
+        // statement's entry parsed it as CSV (#2260). An entry that declares
+        // its format is dispatched to that parser; one that declares nothing
+        // keeps the old CSV default.
+        return match entry_format {
+            Some(EntryFormat::Ofx) => Arc::new(OfxImporter),
+            _ => Arc::new(CsvImporter),
+        };
     }
+    registry
+        .identify(file)
+        .unwrap_or_else(|| Arc::new(CsvImporter) as Arc<dyn Importer>)
 }
 
 fn importers_config_not_found_message() -> anyhow::Error {
@@ -758,6 +912,73 @@ fn build_registry(args: &Args) -> Result<ImporterRegistry> {
 // canonical config-schema module, shared with the WASI component).
 use rustledger_importer::toml_entry::parse_amount_locale;
 
+/// Refuse output configurations that would destroy an existing ledger.
+///
+/// `--output` opens the target with `File::create`, which truncates. That is
+/// fine for a fresh file and catastrophic for one the user has been editing:
+/// a second `extract` into the same path replaces prior imports, hand-written
+/// narrations, metadata, and manual categorization with only the newly
+/// extracted directives (#2251).
+///
+/// Two configurations are rejected here, before any extraction work happens,
+/// so the user is not told "extracted N transactions" by a run that then fails:
+///
+/// - `--existing` and `--output` naming the same file. There is no correct
+///   outcome: the file is read for dedup and then overwritten with only the
+///   *non*-duplicate remainder, so the better the dedup works the more it
+///   deletes. In the all-duplicates case the ledger is emptied outright.
+///   `--force` does NOT override this, because it cannot express anything the
+///   user could plausibly want; merging into an existing ledger is future work.
+/// - A non-empty `--output` target without `--force`.
+fn validate_output_target(args: &Args) -> Result<()> {
+    let Some(ref output) = args.output else {
+        return Ok(());
+    };
+
+    if let Some(ref existing) = args.existing {
+        // Compare canonicalized paths so `./l.beancount` and `l.beancount`
+        // are recognized as the same file. canonicalize() requires the path
+        // to exist; if either side does not resolve, fall back to comparing
+        // as given rather than silently skipping the check.
+        let same = match (existing.canonicalize(), output.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => existing == output,
+        };
+        if same {
+            anyhow::bail!(
+                "--existing and --output name the same file ({})\n  \
+                 this would read it for duplicate detection and then overwrite it \
+                 with only the non-duplicate transactions, deleting everything else\n  \
+                 try: --output to a different file, or append with `rledger extract … >> {}`",
+                output.display(),
+                output.display()
+            );
+        }
+    }
+
+    if !args.force {
+        // Treat only a non-empty regular file as content worth protecting;
+        // a 0-byte file is indistinguishable from "not started yet".
+        if let Ok(meta) = fs::metadata(output)
+            && meta.is_file()
+            && meta.len() > 0
+        {
+            anyhow::bail!(
+                "refusing to overwrite {} ({} bytes)\n  \
+                 --output truncates the target, which would destroy its current \
+                 contents (previous imports, narrations, metadata)\n  \
+                 try: append with `rledger extract … >> {}`, write elsewhere, \
+                 or pass --force to overwrite deliberately",
+                output.display(),
+                meta.len(),
+                output.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the extract command with the given arguments, writing extracted
 /// directives to stdout.
 ///
@@ -776,6 +997,10 @@ pub fn run(args: &Args, file: &Path) -> Result<()> {
 /// default stdout sink for the formatted directives is redirected to the
 /// injected writer.
 pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Result<()> {
+    // Validate the output target BEFORE any extraction work, so a run that
+    // cannot safely write never reports having extracted anything (#2251).
+    validate_output_target(args)?;
+
     // External preprocessing (PDF etc.): if the resolved config entry
     // declares `preprocess`, run it FIRST and hand the rest of the
     // pipeline a temp .csv holding its stdout — so `--auto` inference,
@@ -804,7 +1029,82 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
     // CSV config eagerly would error on "No importers defined" when a
     // user runs e.g. `--config x.toml --wasm-importer my.wasm` with
     // an x.toml that only sets `wasm_importer_dir`.
-    let importer = select_importer(&registry, file, args);
+    // A `--ledger` profile, if one applies. Read before dispatch because it
+    // can name the parser as well as supply the account (#2257). Errors here
+    // are reported, not swallowed: `--ledger` is explicit opt-in, so a ledger
+    // that cannot be read or whose profiles are ambiguous is a real problem
+    // the user asked us to look at.
+    let profile = match args.ledger.as_deref() {
+        Some(ledger_path) => {
+            // Loaded even when it will not be applied, so a broken ledger is
+            // still reported: `--ledger` is an explicit request to read it.
+            let profiles = ledger_profile::load_profiles(ledger_path)?;
+            let filename = source_file
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default();
+            let matched = ledger_profile::match_profile(&profiles, filename)?;
+
+            // An explicit `--importer` names the entry to use, which settles
+            // both the parser and the account; a profile matched by filename
+            // is then a second opinion nobody asked for. Dropped rather than
+            // merged — merging is how the account came from one source and
+            // the column mappings from another. Said out loud, because a
+            // silently ignored `--ledger` is the failure this feature keeps
+            // reproducing.
+            if matched.is_some() && args.importer.is_some() {
+                eprintln!(
+                    "warning: --importer was given, so the --ledger profile for \
+                     {} is not applied",
+                    matched.as_ref().map_or("", |p| p.account.as_str())
+                );
+                None
+            } else {
+                matched
+            }
+        }
+        None => None,
+    };
+
+    // `importer:` names either a built-in parser or an `importers.toml` entry.
+    // Splitting them here keeps the rest of the flow unaware of the source.
+    let profile_builtin = profile.as_ref().and_then(|p| match p.importer.as_str() {
+        "ofx" | "qfx" => Some(EntryFormat::Ofx),
+        "csv" => Some(EntryFormat::Csv),
+        _ => None,
+    });
+    let profile_entry_name = profile
+        .as_ref()
+        .filter(|_| profile_builtin.is_none())
+        .map(|p| p.importer.clone());
+
+    // An explicit `--importer` outranks a profile: the flag is this
+    // invocation, the ledger is standing configuration.
+    let effective_entry_name: Option<String> =
+        args.importer.clone().or_else(|| profile_entry_name.clone());
+
+    // Resolve the config entry BEFORE dispatch so an entry can say which
+    // parser it configures. Tolerant on purpose: discovery must not fail a
+    // path that would never have read a config (`--auto`, raw arguments) —
+    // the same rule `maybe_preprocess` documents. Every branch that goes on
+    // to USE the config re-resolves it below and reports the error there.
+    let resolved_entry =
+        resolve_entry_for_dispatch(args, source_file, profile_entry_name.as_deref());
+    let entry_format = resolved_entry
+        .as_ref()
+        .and_then(|e| e.format.as_deref())
+        .and_then(|f| match f {
+            "ofx" | "qfx" => Some(EntryFormat::Ofx),
+            _ => None,
+        });
+
+    let entry_format = entry_format.or(profile_builtin);
+    let importer = select_importer(
+        &registry,
+        file,
+        effective_entry_name.is_some(),
+        entry_format,
+    );
 
     // Stringly-typed dispatcher check: `CsvImporter::name()` returns
     // the literal "CSV". Acceptable coupling for a CLI-internal
@@ -820,13 +1120,71 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
     // - CSV dispatcher: builds the full CsvConfig from
     //   --importer/--config/--auto/raw-args sources.
     let (config, fallback_accounts) = if dispatcher_needs_minimal_config {
+        // An entry's values are authoritative when one applies, matching
+        // `build_config_from_entry` on the CSV path — which builds purely
+        // from the entry and does not merge CLI arguments. Before #2260 this
+        // branch read CLI arguments only, so a configured OFX account was
+        // silently discarded and every posting landed on the `--account`
+        // default.
+        // Suppressed when a profile applies: it already supplied the account,
+        // so warning that we fell back to `--account` would be false.
+        let entry = entry_for_minimal_config(
+            args,
+            source_file,
+            effective_entry_name.as_deref(),
+            profile.is_none(),
+        );
+        // Every source that can name an account, in precedence order. Kept
+        // as one binding so the refusal below cannot disagree with the value
+        // actually used — checking only `args.account` meant an entry or
+        // profile naming `Assets:Bank:Checking` was treated as unnamed.
+        let named_account = profile
+            .as_ref()
+            .map(|p| p.account.clone())
+            .or_else(|| entry.as_ref().and_then(|e| e.account.clone()))
+            .or_else(|| args.account.clone());
+
         let cfg = rustledger_importer::ImporterConfig {
-            account: args.account.clone(),
-            currency: Some(args.currency.clone()),
+            // A `--ledger` profile wins over a TOML entry for these two:
+            // the `open` directive IS the account's declaration, so repeating
+            // it in config and disagreeing would be the bug, not the config.
+            account: named_account
+                .clone()
+                .unwrap_or_else(|| args.account_or_default()),
+            currency: Some(
+                profile
+                    .as_ref()
+                    .and_then(|p| p.currency.clone())
+                    .or_else(|| entry.as_ref().and_then(|e| e.currency.clone()))
+                    .unwrap_or_else(|| args.currency.clone()),
+            ),
             importer_type: rustledger_importer::config::ImporterType::Csv(
                 rustledger_importer::config::CsvConfig::default(),
             ),
         };
+        // Nothing chose this account: no `--account`, no `importers.toml`
+        // entry, no `--ledger` profile. Importing a credit-card statement
+        // into the `Assets:` default inverts the sign of every transaction
+        // and posts them to an account the user never named, so refuse
+        // rather than warn (#2256). Only for a statement that says which
+        // side it is; silence from the file means no opinion.
+        if named_account.is_none()
+            && importer.name() == "OFX/QFX"
+            && let Ok(content) = fs::read_to_string(file)
+            && rustledger_importer::ofx_importer::detect_statement_kind(&content)
+                == Some(rustledger_importer::ofx_importer::StatementKind::Liability)
+        {
+            anyhow::bail!(
+                "this statement describes a liability account, but no account was \
+                 configured so the default `{DEFAULT_ACCOUNT}` would be used — every \
+                 amount would carry the opposite sign\n  \
+                 name the account with one of:\n    \
+                 --account Liabilities:...\n    \
+                 an `importers.toml` entry with `account = \"Liabilities:...\"`\n    \
+                 an `open` directive plus --ledger (see `rledger extract --help`)"
+            );
+        }
+
         // OFX importer routes negative amounts to `Expenses:Unknown`
         // and positive amounts to `Income:Unknown` (ofx_importer.rs's
         // `parse_transaction`). Both must be in the fallback list so
@@ -840,8 +1198,9 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
     } else {
         // CSV branch: determine import config from --importer flag,
         // explicit --config, --auto, or raw CLI args.
-        let config = if let Some(ref importer_name) = args.importer {
-            // Explicit --importer: require config file, find named entry
+        let config = if let Some(ref importer_name) = effective_entry_name {
+            // A named entry, from `--importer` or from a `--ledger` profile's
+            // `importer:` key: require a config file and find that entry.
             let config_path = find_importers_config(args.config.as_deref())?
                 .ok_or_else(importers_config_not_found_message)?;
 
@@ -940,14 +1299,14 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
                 csv_config.amount_format = Some(format.clone());
             }
             ImporterConfig {
-                account: args.account.clone(),
+                account: args.account_or_default(),
                 currency: Some(args.currency.clone()),
                 importer_type: rustledger_importer::config::ImporterType::Csv(csv_config),
             }
         } else {
             // No config file: build from CLI arguments
             let mut builder = ImporterConfig::csv()
-                .account(&args.account)
+                .account(args.account_or_default())
                 .currency(&args.currency)
                 .date_format(&args.date_format)
                 .delimiter(args.delimiter)
@@ -1037,6 +1396,19 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
                 .clone()
                 .unwrap_or_else(|| "Income:Unknown".to_string()),
         ];
+        // A `--ledger` profile outranks whatever the entry said, on this path
+        // as much as the minimal one: the `open` directive IS the account's
+        // declaration. Applied after the chain so every arm above is covered,
+        // including `--auto` and raw CLI arguments.
+        let config = match profile.as_ref() {
+            Some(p) => ImporterConfig {
+                account: p.account.clone(),
+                currency: p.currency.clone().or(config.currency),
+                ..config
+            },
+            None => config,
+        };
+
         (config, fallbacks)
     };
 
@@ -1123,7 +1495,7 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
 
         let balance = rustledger_ops::reconcile::StatementBalance {
             date,
-            account: args.account.clone(),
+            account: args.account_or_default(),
             number: amount,
             currency: args.currency.clone(),
         };
@@ -1137,6 +1509,25 @@ pub fn run_with_writer<W: Write>(args: &Args, file: &Path, out: &mut W) -> Resul
     } else {
         directives
     };
+
+    // Nothing survived (typically: every transaction was already present in
+    // `--existing`). Writing here would truncate the target to an empty file
+    // while reporting a successful no-op — the #2251 all-duplicates case.
+    // Leaving it untouched is the correct outcome, and is not an error.
+    if directives.is_empty() {
+        eprintln!(
+            "Nothing to write from {} (every extracted transaction was already present)",
+            file.display()
+        );
+        // Only claim the file was left alone if it actually exists; saying
+        // "left unchanged" about a path that was never created is misleading.
+        if let Some(ref output_path) = args.output
+            && output_path.exists()
+        {
+            eprintln!("{} left unchanged", output_path.display());
+        }
+        return Ok(());
+    }
 
     // Render every directive in the canonical form `rledger format`
     // would write. canonicalize_directives is the single source of
@@ -1724,6 +2115,7 @@ preprocess = ["cat", "{input}"]
     #[test]
     fn test_build_config_from_entry_basic() {
         let entry = ImporterEntry {
+            format: None,
             name: "test".to_string(),
             account: Some("Assets:Bank:Test".to_string()),
             currency: Some("EUR".to_string()),
@@ -1764,6 +2156,7 @@ preprocess = ["cat", "{input}"]
         mappings.insert("WHOLE FOODS".to_string(), "Expenses:Groceries".to_string());
 
         let entry = ImporterEntry {
+            format: None,
             name: "test".to_string(),
             account: Some("Assets:Bank".to_string()),
             currency: None,
@@ -1803,6 +2196,7 @@ preprocess = ["cat", "{input}"]
     #[test]
     fn test_build_config_from_entry_with_default_expense() {
         let entry = ImporterEntry {
+            format: None,
             name: "test".to_string(),
             account: Some("Assets:Bank".to_string()),
             currency: None,
@@ -1843,6 +2237,7 @@ preprocess = ["cat", "{input}"]
     #[test]
     fn test_build_config_from_entry_all_options() {
         let entry = ImporterEntry {
+            format: None,
             name: "full".to_string(),
             account: Some("Assets:Bank".to_string()),
             currency: Some("GBP".to_string()),
@@ -1991,11 +2386,55 @@ default_expense = "Expenses:Uncategorized"
     // `.ofx`-named file would silently dispatch to `OfxImporter` and drop
     // the user's column mappings.
 
+    /// #2260: `--importer` forced `CsvImporter` unconditionally, so naming an
+    /// OFX statement's entry parsed it as CSV. An entry that declares its
+    /// format now reaches the parser it was written for.
+    #[test]
+    fn select_importer_honors_an_ofx_entry_type() {
+        let registry = ImporterRegistry::with_builtins();
+        let args = Args::parse_from(["extract", "--importer", "card", "s.qfx"]);
+        let imp = select_importer(
+            &registry,
+            Path::new("s.qfx"),
+            args.importer.is_some(),
+            Some(EntryFormat::Ofx),
+        );
+        assert_eq!(imp.name(), "OFX/QFX");
+    }
+
+    /// The complement, and the older guard this must not undo: an entry that
+    /// declares nothing keeps forcing CSV even on an `.ofx`-named file, so a
+    /// CSV entry's column mappings are not silently dropped.
+    #[test]
+    fn select_importer_still_forces_csv_for_an_untyped_entry() {
+        let registry = ImporterRegistry::with_builtins();
+        let args = Args::parse_from(["extract", "--importer", "mapped", "s.ofx"]);
+        assert_eq!(
+            select_importer(&registry, Path::new("s.ofx"), args.importer.is_some(), None).name(),
+            "CSV"
+        );
+        assert_eq!(
+            select_importer(
+                &registry,
+                Path::new("s.ofx"),
+                args.importer.is_some(),
+                Some(EntryFormat::Csv)
+            )
+            .name(),
+            "CSV"
+        );
+    }
+
     #[test]
     fn test_select_importer_csv_extension_picks_csv() {
         let registry = ImporterRegistry::with_builtins();
         let args = Args::parse_from(["extract", "ignored.csv"]);
-        let imp = select_importer(&registry, Path::new("foo.csv"), &args);
+        let imp = select_importer(
+            &registry,
+            Path::new("foo.csv"),
+            args.importer.is_some(),
+            None,
+        );
         assert_eq!(imp.name(), "CSV");
     }
 
@@ -2003,7 +2442,12 @@ default_expense = "Expenses:Uncategorized"
     fn test_select_importer_ofx_extension_picks_ofx() {
         let registry = ImporterRegistry::with_builtins();
         let args = Args::parse_from(["extract", "ignored.ofx"]);
-        let imp = select_importer(&registry, Path::new("foo.ofx"), &args);
+        let imp = select_importer(
+            &registry,
+            Path::new("foo.ofx"),
+            args.importer.is_some(),
+            None,
+        );
         assert_eq!(imp.name(), "OFX/QFX");
     }
 
@@ -2016,7 +2460,12 @@ default_expense = "Expenses:Uncategorized"
         // must override this case.
         let registry = ImporterRegistry::with_builtins();
         let args = Args::parse_from(["extract", "ignored.ofx", "--importer", "chase"]);
-        let imp = select_importer(&registry, Path::new("foo.ofx"), &args);
+        let imp = select_importer(
+            &registry,
+            Path::new("foo.ofx"),
+            args.importer.is_some(),
+            None,
+        );
         assert_eq!(
             imp.name(),
             "CSV",
@@ -2031,7 +2480,12 @@ default_expense = "Expenses:Uncategorized"
         // path should choose CSV rather than erroring.
         let registry = ImporterRegistry::with_builtins();
         let args = Args::parse_from(["extract", "ignored.qbo"]);
-        let imp = select_importer(&registry, Path::new("foo.qbo"), &args);
+        let imp = select_importer(
+            &registry,
+            Path::new("foo.qbo"),
+            args.importer.is_some(),
+            None,
+        );
         assert_eq!(imp.name(), "CSV");
     }
 
@@ -2065,7 +2519,12 @@ default_expense = "Expenses:Uncategorized"
             wasm_path.to_str().unwrap(),
         ]);
         let registry = build_registry(&args).expect("builds");
-        let imp = select_importer(&registry, Path::new("foo.mt940"), &args);
+        let imp = select_importer(
+            &registry,
+            Path::new("foo.mt940"),
+            args.importer.is_some(),
+            None,
+        );
         assert_eq!(
             imp.name(),
             "mt9",
@@ -2270,6 +2729,417 @@ default_expense = "Expenses:Uncategorized"
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert!(output.contains("2024-01-15"));
         assert!(output.contains("Coffee"));
+    }
+
+    /// #2251: `--output` truncates, so a second extract into a file the user
+    /// has been editing destroys it. Refuse unless `--force`.
+    #[test]
+    fn refuses_to_overwrite_nonempty_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("feb.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-02-01,Books,18.00\n").unwrap();
+
+        let output = dir.path().join("ledger.beancount");
+        let curated = "2024-01-15 * \"Blue Bottle\" \"Morning coffee\"\n  \
+                       Assets:Bank:Checking  -4.50 USD\n  Expenses:Food:Coffee\n";
+        std::fs::write(&output, curated).unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        let err = run(&args, &csv).expect_err("must refuse to truncate a non-empty file");
+
+        assert!(
+            err.to_string().contains("--force"),
+            "the error should name the escape hatch, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            curated,
+            "the curated ledger must be byte-identical after a refused run"
+        );
+    }
+
+    /// The refusal is a guard, not a prohibition: `--force` still overwrites.
+    #[test]
+    fn force_permits_overwriting_nonempty_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("feb.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-02-01,Books,18.00\n").unwrap();
+
+        let output = dir.path().join("ledger.beancount");
+        std::fs::write(
+            &output,
+            "2024-01-15 * \"Old\"\n  Assets:A  1.00 USD\n  Expenses:B\n",
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+        ]);
+        run(&args, &csv).expect("--force overwrites deliberately");
+
+        let written = std::fs::read_to_string(&output).unwrap();
+        assert!(written.contains("Books"), "got: {written}");
+        assert!(!written.contains("Old"), "force replaces, got: {written}");
+    }
+
+    /// A zero-byte file is indistinguishable from "not started yet", so it is
+    /// not content worth protecting and needs no `--force`.
+    #[test]
+    fn empty_output_file_needs_no_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("jan.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-01-15,Coffee,5.00\n").unwrap();
+
+        let output = dir.path().join("ledger.beancount");
+        std::fs::write(&output, "").unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        run(&args, &csv).expect("a 0-byte target is not protected");
+        assert!(std::fs::read_to_string(&output).unwrap().contains("Coffee"));
+    }
+
+    /// #2251: `--existing` sounds protective but is not — the file is read for
+    /// dedup and then overwritten with only the non-duplicate remainder, so the
+    /// better dedup works the more it deletes. `--force` must not unlock this.
+    #[test]
+    fn refuses_existing_and_output_naming_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("jan.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-01-15,Coffee,5.00\n").unwrap();
+
+        let ledger = dir.path().join("ledger.beancount");
+        let contents = "2024-01-15 * \"Coffee\"\n  Assets:Bank:Checking  -5.00 USD\n  \
+                        Expenses:Food\n";
+        std::fs::write(&ledger, contents).unwrap();
+
+        for extra in [vec![], vec!["--force"]] {
+            let mut argv = vec![
+                "extract",
+                csv.to_str().unwrap(),
+                "-o",
+                ledger.to_str().unwrap(),
+                "--existing",
+                ledger.to_str().unwrap(),
+            ];
+            argv.extend(extra.iter().copied());
+
+            let args = Args::parse_from(argv);
+            let err =
+                run(&args, &csv).expect_err("--existing and --output on one file is never correct");
+            assert!(err.to_string().contains("same file"), "got: {err}");
+            assert_eq!(
+                std::fs::read_to_string(&ledger).unwrap(),
+                contents,
+                "the ledger must survive regardless of --force"
+            );
+        }
+    }
+
+    /// #2251, worst case: when every extracted transaction is already present,
+    /// the old code wrote an empty file and reported a successful no-op,
+    /// emptying the ledger. Nothing to write must mean nothing is written.
+    #[test]
+    fn all_duplicates_leaves_output_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("jan.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-01-15,Coffee,5.00\n").unwrap();
+
+        // Extract once to a fresh file, then reuse it as both the dedup source
+        // and (with --force, to bypass the overwrite guard) the output target.
+        let output = dir.path().join("out.beancount");
+        let first = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ]);
+        run(&first, &csv).unwrap();
+        let after_first = std::fs::read_to_string(&output).unwrap();
+        assert!(!after_first.is_empty(), "precondition: first run wrote");
+
+        let existing = dir.path().join("existing.beancount");
+        std::fs::copy(&output, &existing).unwrap();
+
+        let second = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--existing",
+            existing.to_str().unwrap(),
+            "--force",
+        ]);
+        run(&second, &csv).expect("all-duplicates is a no-op, not an error");
+
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            after_first,
+            "an all-duplicates run must not truncate the target"
+        );
+    }
+
+    /// Deep-review finding on #2262: a profile naming a TOML entry did not
+    /// reach the dispatcher, so an entry declaring `type = "ofx"` was parsed
+    /// as CSV — the #2260 failure, reintroduced through the profile path. It
+    /// passed a first test only because a single-entry config falls back to
+    /// "the only entry"; three entries remove that accident.
+    #[test]
+    fn a_profile_naming_an_ofx_entry_dispatches_to_ofx() {
+        let dir = tempfile::tempdir().unwrap();
+        let qfx = dir.path().join("card.qfx");
+        std::fs::write(
+            &qfx,
+            "OFXHEADER:100\n<OFX><CREDITCARDMSGSRSV1><CCSTMTTRNRS><CCSTMTRS><CURDEF>USD\n\
+             <BANKTRANLIST><STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20240115<TRNAMT>-50.00\
+             <FITID>t1<NAME>COFFEE</STMTTRN></BANKTRANLIST>\n\
+             </CCSTMTRS></CCSTMTTRNRS></CREDITCARDMSGSRSV1></OFX>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("importers.toml"),
+            "[[importers]]\nname = \"card\"\ntype = \"ofx\"\n\
+             account = \"Liabilities:FromToml\"\ncurrency = \"USD\"\n\
+             filename_pattern = \"*.NOMATCH\"\n\n\
+             [[importers]]\nname = \"b\"\nfilename_pattern = \"*.NOMATCH2\"\n\n\
+             [[importers]]\nname = \"c\"\nfilename_pattern = \"*.NOMATCH3\"\n",
+        )
+        .unwrap();
+        let ledger = dir.path().join("main.beancount");
+        std::fs::write(
+            &ledger,
+            "2024-01-01 open Liabilities:FromLedger USD\n  \
+             importer: \"card\"\n  importer-pattern: \"*.qfx\"\n",
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            qfx.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+        ]);
+        let mut out = Vec::new();
+        with_cwd(dir.path(), || run_with_writer(&args, &qfx, &mut out))
+            .expect("the ofx entry must be parsed as OFX, not CSV");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("COFFEE"), "OFX did not parse; got:\n{text}");
+        assert!(
+            text.contains("Liabilities:FromLedger"),
+            "the ledger account must win; got:\n{text}"
+        );
+    }
+
+    fn cc_qfx(dir: &Path) -> PathBuf {
+        let p = dir.join("card.qfx");
+        std::fs::write(
+            &p,
+            "OFXHEADER:100\n<OFX><CREDITCARDMSGSRSV1><CCSTMTTRNRS><CCSTMTRS><CURDEF>USD\n\
+             <BANKTRANLIST><STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20240115<TRNAMT>-50.00\
+             <FITID>t1<NAME>COFFEE</STMTTRN></BANKTRANLIST>\n\
+             </CCSTMTRS></CCSTMTTRNRS></CREDITCARDMSGSRSV1></OFX>",
+        )
+        .unwrap();
+        p
+    }
+
+    /// #2256: with nothing naming an account, a credit-card statement would
+    /// post to the `Assets:` default — an account the user never chose, with
+    /// every sign inverted. Refuse rather than warn.
+    #[test]
+    fn an_unconfigured_credit_card_import_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let qfx = cc_qfx(dir.path());
+        let args = Args::parse_from(["extract", qfx.to_str().unwrap()]);
+        let mut out = Vec::new();
+        let err = with_cwd(dir.path(), || run_with_writer(&args, &qfx, &mut out))
+            .expect_err("an unnamed account must not silently become the default");
+        let msg = err.to_string();
+        assert!(msg.contains("liability"), "got: {msg}");
+        assert!(
+            msg.contains("--account"),
+            "the error must say how to fix it: {msg}"
+        );
+    }
+
+    /// Naming the account is enough, even when it is the same string as the
+    /// default: "not named" and "named as the default" are different, and only
+    /// the first is refused. The mismatch warning still applies.
+    #[test]
+    fn naming_the_account_explicitly_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let qfx = cc_qfx(dir.path());
+        for account in ["Liabilities:CreditCard", DEFAULT_ACCOUNT] {
+            let args = Args::parse_from(["extract", qfx.to_str().unwrap(), "--account", account]);
+            let mut out = Vec::new();
+            with_cwd(dir.path(), || run_with_writer(&args, &qfx, &mut out))
+                .unwrap_or_else(|e| panic!("--account {account} must be honored, got: {e}"));
+            assert!(String::from_utf8(out).unwrap().contains(account));
+        }
+    }
+
+    /// Copilot review on #2263: the guard checked only `args.account`, so an
+    /// `importers.toml` entry or `--ledger` profile naming the same string as
+    /// the default was treated as "nobody named an account" and refused.
+    #[test]
+    fn an_account_named_by_config_is_not_treated_as_unnamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let qfx = cc_qfx(dir.path());
+        // The entry names the DEFAULT string deliberately: that is the case
+        // that distinguishes "named" from "not named".
+        std::fs::write(
+            dir.path().join("importers.toml"),
+            format!(
+                "[[importers]]\nname = \"card\"\ntype = \"ofx\"\n\
+                 account = \"{DEFAULT_ACCOUNT}\"\ncurrency = \"USD\"\n\
+                 filename_pattern = \"*.qfx\"\n"
+            ),
+        )
+        .unwrap();
+
+        let args = Args::parse_from(["extract", qfx.to_str().unwrap()]);
+        let mut out = Vec::new();
+        with_cwd(dir.path(), || run_with_writer(&args, &qfx, &mut out))
+            .expect("an account named by config is named, even if it is the default");
+        assert!(String::from_utf8(out).unwrap().contains(DEFAULT_ACCOUNT));
+    }
+
+    /// The refusal is specific to a contradiction: a bank statement with no
+    /// configured account still imports to the default.
+    #[test]
+    fn an_unconfigured_bank_import_still_uses_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let qfx = dir.path().join("bank.qfx");
+        std::fs::write(
+            &qfx,
+            "OFXHEADER:100\n<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CURDEF>USD\n\
+             <BANKACCTFROM><ACCTID>1<ACCTTYPE>CHECKING</BANKACCTFROM>\n\
+             <BANKTRANLIST><STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20240115<TRNAMT>-50.00\
+             <FITID>t1<NAME>COFFEE</STMTTRN></BANKTRANLIST>\n\
+             </STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>",
+        )
+        .unwrap();
+        let args = Args::parse_from(["extract", qfx.to_str().unwrap()]);
+        let mut out = Vec::new();
+        with_cwd(dir.path(), || run_with_writer(&args, &qfx, &mut out)).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(DEFAULT_ACCOUNT));
+    }
+
+    /// The guard reasons about `DEFAULT_ACCOUNT` being an asset account, and
+    /// clap fills the same constant in. Pin both so they cannot drift apart.
+    #[test]
+    fn the_default_account_is_what_the_guard_assumes() {
+        assert!(
+            DEFAULT_ACCOUNT.starts_with("Assets:"),
+            "the refusal logic assumes the default is an asset account"
+        );
+        let args = Args::parse_from(["extract", "f.qfx"]);
+        assert_eq!(args.account, None, "an unnamed account must stay None");
+        assert_eq!(args.account_or_default(), DEFAULT_ACCOUNT);
+    }
+
+    /// Third review pass on #2262: the fix that made a profile outrank
+    /// `importers.toml` applied unconditionally, so it also overrode an
+    /// explicit `--importer` — contradicting the documented precedence, and
+    /// introduced by the previous fix.
+    #[test]
+    fn an_explicit_importer_flag_outranks_a_ledger_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("bank.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-01-15,COFFEE,-4.50\n").unwrap();
+        std::fs::write(
+            dir.path().join("importers.toml"),
+            "[[importers]]\nname = \"flagentry\"\naccount = \"Assets:FromFlag\"\n\
+             currency = \"USD\"\ndate_column = \"Date\"\n\
+             narration_column = \"Description\"\namount_column = \"Amount\"\n\
+             filename_pattern = \"*.NOMATCH\"\n\n\
+             [[importers]]\nname = \"b\"\nfilename_pattern = \"*.NOMATCH2\"\n",
+        )
+        .unwrap();
+        let ledger = dir.path().join("main.beancount");
+        std::fs::write(
+            &ledger,
+            "2024-01-01 open Assets:FromLedger USD\n  \
+             importer: \"flagentry\"\n  importer-pattern: \"*.csv\"\n",
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--importer",
+            "flagentry",
+        ]);
+        let mut out = Vec::new();
+        with_cwd(dir.path(), || run_with_writer(&args, &csv, &mut out)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("Assets:FromFlag"),
+            "the explicit flag must win; got:\n{text}"
+        );
+        assert!(
+            !text.contains("Assets:FromLedger"),
+            "the profile must not override an explicit --importer; got:\n{text}"
+        );
+    }
+
+    /// Deep-review finding on #2262: the docs said a profile outranks
+    /// `importers.toml` for the account, and it did on the minimal-config path
+    /// but not the CSV one, where the entry's account still won.
+    #[test]
+    fn a_profile_account_outranks_the_toml_entry_on_the_csv_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("bank.csv");
+        std::fs::write(&csv, "Date,Description,Amount\n2024-01-15,COFFEE,-4.50\n").unwrap();
+        std::fs::write(
+            dir.path().join("importers.toml"),
+            "[[importers]]\nname = \"bank\"\naccount = \"Assets:FromToml\"\n\
+             currency = \"USD\"\ndate_column = \"Date\"\n\
+             narration_column = \"Description\"\namount_column = \"Amount\"\n\
+             filename_pattern = \"*.NOMATCH\"\n\n\
+             [[importers]]\nname = \"b\"\nfilename_pattern = \"*.NOMATCH2\"\n",
+        )
+        .unwrap();
+        let ledger = dir.path().join("main.beancount");
+        std::fs::write(
+            &ledger,
+            "2024-01-01 open Assets:FromLedger USD\n  \
+             importer: \"bank\"\n  importer-pattern: \"*.csv\"\n",
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            csv.to_str().unwrap(),
+            "--ledger",
+            ledger.to_str().unwrap(),
+        ]);
+        let mut out = Vec::new();
+        with_cwd(dir.path(), || run_with_writer(&args, &csv, &mut out)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("Assets:FromLedger"),
+            "the open directive is the account's declaration; got:\n{text}"
+        );
+        assert!(
+            !text.contains("Assets:FromToml"),
+            "the TOML account must not win; got:\n{text}"
+        );
     }
 
     #[test]

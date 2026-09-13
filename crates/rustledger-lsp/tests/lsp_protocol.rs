@@ -999,6 +999,535 @@ fn included_file_validation_errors_are_published() {
     );
 }
 
+/// Drain every `publishDiagnostics` for `uri` and return its E1001s.
+///
+/// Waits up to a hard deadline for the FIRST publish, then only for a short
+/// quiet window, so a test costs the server's actual latency rather than a
+/// fixed timeout. Draining every publish rather than asserting on the first
+/// matters: the server may publish an empty set before the validated one, and
+/// stopping there satisfies "no E1001" without ever seeing the real answer.
+fn drain_e1001_for(client: &mut LspTestClient, uri: &str) -> Vec<lsp_types::Diagnostic> {
+    let hard_deadline = Instant::now() + Duration::from_secs(15);
+    let quiet = Duration::from_millis(500);
+    let mut publishes = 0usize;
+    let mut offenders: Vec<lsp_types::Diagnostic> = Vec::new();
+    while Instant::now() < hard_deadline {
+        let wait = if publishes == 0 {
+            hard_deadline.saturating_duration_since(Instant::now())
+        } else {
+            quiet
+        };
+        let Some(msg) = client.recv_with_timeout(wait) else {
+            break;
+        };
+        if let lsp_server::Message::Notification(n) = msg
+            && n.method == "textDocument/publishDiagnostics"
+        {
+            let p: lsp_types::PublishDiagnosticsParams =
+                serde_json::from_value(n.params).expect("valid publishDiagnostics");
+            if same_file(&p.uri, uri) {
+                publishes += 1;
+                offenders.extend(p.diagnostics.into_iter().filter(|d| {
+                    matches!(&d.code, Some(lsp_types::NumberOrString::String(s)) if s == "E1001")
+                }));
+            }
+        }
+    }
+    assert!(publishes > 0, "no publishDiagnostics for {uri}");
+    offenders
+}
+
+/// Regression for #2285: in SINGLE-FILE mode (no `rustledger.journalFile`),
+/// an `open` directive living in an `include`d file must still count.
+///
+/// The reporter's case exactly: `rledger check` on the same file reports no
+/// errors while the LSP reports "Account Assets:Cash was never opened". A
+/// false error in the editor against a file the CLI calls clean is the worst
+/// shape of wrong: the tool contradicts itself, and the one the user is
+/// looking at is the one that is wrong.
+#[test]
+fn issue_2285_open_in_an_included_file_counts_without_a_journal_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root_path = tmp.path().join("m1.beancount");
+    let accounts_path = tmp.path().join("m1-accounts.beancount");
+
+    std::fs::write(&accounts_path, "2025-01-01 open Assets:Cash\n").expect("write accounts");
+    std::fs::write(
+        &root_path,
+        format!(
+            "include \"{}\"\n2026-01-01 balance Assets:Cash               0.00 EUR\n",
+            include_name(&accounts_path)
+        ),
+    )
+    .expect("write root");
+
+    // No journal file: single-file mode, the path most users follow and the
+    // one the reporter was on.
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let root_uri = uri_for(&root_path);
+    let root_src = std::fs::read_to_string(&root_path).expect("read root");
+    client.open_document(&root_uri, &root_src);
+
+    let offenders = drain_e1001_for(&mut client, &root_uri);
+    assert!(
+        offenders.is_empty(),
+        "E1001 for an account opened in an included file; `rledger check` reports this file clean. got: {offenders:?}"
+    );
+}
+
+/// #2285 for the file a user is far more likely to have open: a sub-file that
+/// declares no includes of its own.
+///
+/// `ledger/2025-01.beancount` cannot be its own root, so the server looks
+/// upward for a conventionally named one and adopts it once it proves to
+/// reach this file. Without that, the reported `E1001` survives for everyone
+/// who opens a transactions file rather than the root.
+#[test]
+fn issue_2285_a_sub_file_finds_its_root_upward() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sub_dir = tmp.path().join("ledger");
+    std::fs::create_dir_all(&sub_dir).expect("mkdir");
+
+    let accounts_path = tmp.path().join("accounts.beancount");
+    let sub_path = sub_dir.join("2025-01.beancount");
+    let root_path = tmp.path().join("main.beancount");
+
+    std::fs::write(
+        &accounts_path,
+        "2025-01-01 open Assets:Cash EUR\n2025-01-01 open Expenses:Food EUR\n",
+    )
+    .expect("write accounts");
+    std::fs::write(
+        &sub_path,
+        "2026-01-01 * \"lunch\"\n  Assets:Cash   -5 EUR\n  Expenses:Food  5 EUR\n",
+    )
+    .expect("write sub");
+    std::fs::write(
+        &root_path,
+        format!(
+            "include \"{}\"\ninclude \"ledger/2025-01.beancount\"\n",
+            include_name(&accounts_path)
+        ),
+    )
+    .expect("write root");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let sub_uri = uri_for(&sub_path);
+    let sub_src = std::fs::read_to_string(&sub_path).expect("read sub");
+    client.open_document(&sub_uri, &sub_src);
+
+    let offenders = drain_e1001_for(&mut client, &sub_uri);
+    assert!(
+        offenders.is_empty(),
+        "E1001 in a sub-file whose accounts are opened in a sibling include; got: {offenders:?}"
+    );
+}
+
+/// The upward search must not adopt a root that has nothing to do with the
+/// file, which is what `contains_file` is for.
+///
+/// A stray `main.beancount` higher up the tree is common: one repo, several
+/// unrelated ledgers. Adopting it is not visible in the opened file's own
+/// diagnostics -- a file the ledger does not contain falls back to single-file
+/// validation and looks the same either way -- so this asserts the part that
+/// does show: adoption is STICKY, and a wrong one locks out the real root for
+/// the rest of the session.
+///
+/// The first draft asserted on the opened file's diagnostics and passed with
+/// `contains_file` removed.
+#[test]
+fn issue_2285_an_unrelated_root_upward_is_not_adopted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Ledger A, unrelated, with the conventional name the upward search finds.
+    let other_dir = tmp.path().join("other");
+    std::fs::create_dir_all(&other_dir).expect("mkdir other");
+    std::fs::write(
+        other_dir.join("leaf.beancount"),
+        "2025-01-01 open Assets:Other EUR\n",
+    )
+    .expect("write leaf");
+    std::fs::write(
+        tmp.path().join("main.beancount"),
+        "include \"other/leaf.beancount\"\n",
+    )
+    .expect("write unrelated root");
+
+    // Ledger B, the real one, rooted at a name discovery does not know.
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).expect("mkdir proj");
+    std::fs::write(
+        proj.join("accounts.beancount"),
+        "2025-01-01 open Assets:Cash EUR\n",
+    )
+    .expect("write accounts");
+    let real_root = proj.join("m1.beancount");
+    std::fs::write(
+        &real_root,
+        "include \"accounts.beancount\"\n2026-01-01 balance Assets:Cash 0.00 EUR\n",
+    )
+    .expect("write real root");
+    let sub_path = proj.join("txns.beancount");
+    std::fs::write(&sub_path, "2026-02-01 balance Assets:Cash 0.00 EUR\n").expect("write sub");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    // Opening the sub-file first is what triggers the upward search, and
+    // ledger A is what it finds. Without `contains_file` that gets adopted.
+    let sub_uri = uri_for(&sub_path);
+    let sub_src = std::fs::read_to_string(&sub_path).expect("read sub");
+    client.open_document(&sub_uri, &sub_src);
+    let _ = drain_e1001_for(&mut client, &sub_uri);
+
+    // Now the real root. It can only be adopted if the unrelated one did not
+    // already claim `journal_file`.
+    let root_uri = uri_for(&real_root);
+    let root_src = std::fs::read_to_string(&real_root).expect("read real root");
+    client.open_document(&root_uri, &root_src);
+
+    let offenders = drain_e1001_for(&mut client, &root_uri);
+    assert!(
+        offenders.is_empty(),
+        "an unrelated root upward was adopted and locked out the real one; got: {offenders:?}"
+    );
+}
+
+/// Adopting a root must correct the files that are ALREADY open.
+///
+/// A user opens their transactions file first and sees its accounts reported
+/// unopened, then opens the root to find out why. Adoption fires on that
+/// second open and fixes the ledger, but only the second file was
+/// republished, so the first sat there contradicting the ledger until it was
+/// touched. The wrong diagnostic is exactly the one the user went looking at
+/// the root to explain.
+///
+/// The root lives in a SIBLING directory, which is what keeps this reachable
+/// now that unconventionally named roots are discovered: the search walks
+/// ancestors, so a root beside the data directory rather than above it is
+/// still invisible until it is opened. An earlier fixture put the root one
+/// level up, and once discovery found it there was no "before" state left to
+/// correct; the test said so rather than passing vacuously.
+#[test]
+fn issue_2285_adoption_corrects_documents_already_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let roots = tmp.path().join("roots");
+    std::fs::create_dir_all(&data).expect("mkdir data");
+    std::fs::create_dir_all(&roots).expect("mkdir roots");
+
+    std::fs::write(
+        data.join("accounts.beancount"),
+        "2025-01-01 open Assets:Cash EUR\n2025-01-01 open Expenses:Food EUR\n",
+    )
+    .expect("write accounts");
+    let sub_path = data.join("txns.beancount");
+    std::fs::write(
+        &sub_path,
+        "2026-01-01 * \"lunch\"\n  Assets:Cash   -5 EUR\n  Expenses:Food  5 EUR\n",
+    )
+    .expect("write sub");
+    let root_path = roots.join("m1.beancount");
+    std::fs::write(
+        &root_path,
+        "include \"../data/accounts.beancount\"\ninclude \"../data/txns.beancount\"\n",
+    )
+    .expect("write root");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let sub_uri = uri_for(&sub_path);
+    let sub_src = std::fs::read_to_string(&sub_path).expect("read sub");
+    client.open_document(&sub_uri, &sub_src);
+
+    // Single-file mode: the accounts really do look unopened from here. If
+    // this is ever empty the test has stopped exercising the correction.
+    let before = drain_e1001_for(&mut client, &sub_uri);
+    assert!(
+        !before.is_empty(),
+        "expected the pre-adoption false E1001s; the fixture no longer sets up the case"
+    );
+
+    let root_uri = uri_for(&root_path);
+    let root_src = std::fs::read_to_string(&root_path).expect("read root");
+    client.open_document(&root_uri, &root_src);
+
+    // The LAST word on the sub-file, not any publish: the stale set is still
+    // in the stream ahead of the corrected one.
+    let hard_deadline = Instant::now() + Duration::from_secs(15);
+    let quiet = Duration::from_millis(500);
+    let mut latest: Option<Vec<lsp_types::Diagnostic>> = None;
+    while Instant::now() < hard_deadline {
+        let wait = if latest.is_none() {
+            hard_deadline.saturating_duration_since(Instant::now())
+        } else {
+            quiet
+        };
+        let Some(msg) = client.recv_with_timeout(wait) else {
+            break;
+        };
+        if let lsp_server::Message::Notification(n) = msg
+            && n.method == "textDocument/publishDiagnostics"
+        {
+            let p: lsp_types::PublishDiagnosticsParams =
+                serde_json::from_value(n.params).expect("valid publishDiagnostics");
+            if same_file(&p.uri, &sub_uri) {
+                latest = Some(p.diagnostics);
+            }
+        }
+    }
+
+    let latest = latest.expect("the already-open file was never republished after adoption");
+    let unopened: Vec<_> = latest
+        .iter()
+        .filter(|d| matches!(&d.code, Some(lsp_types::NumberOrString::String(s)) if s == "E1001"))
+        .collect();
+    assert!(
+        unopened.is_empty(),
+        "an already-open file kept its pre-adoption diagnostics; got: {unopened:?}"
+    );
+}
+
+/// A sub-file whose root is not conventionally named still finds it.
+///
+/// `discover_journal_upward` only knows `main.bean`, `ledger.beancount` and
+/// the rest, so the reporter's own root, `m1.beancount`, was invisible to it.
+/// Opening `ledger/2025-01.beancount` under such a ledger kept reporting
+/// accounts as never opened: the same #2285 error, for everyone whose root
+/// happens to be called something else.
+#[test]
+fn a_sub_file_finds_an_unconventionally_named_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sub_dir = tmp.path().join("ledger");
+    std::fs::create_dir_all(&sub_dir).expect("mkdir");
+
+    std::fs::write(
+        tmp.path().join("accounts.beancount"),
+        "2025-01-01 open Assets:Cash EUR\n2025-01-01 open Expenses:Food EUR\n",
+    )
+    .expect("write accounts");
+    let sub_path = sub_dir.join("2025-01.beancount");
+    std::fs::write(
+        &sub_path,
+        "2026-01-01 * \"lunch\"\n  Assets:Cash   -5 EUR\n  Expenses:Food  5 EUR\n",
+    )
+    .expect("write sub");
+    // Deliberately a name no discovery list contains.
+    std::fs::write(
+        tmp.path().join("m1.beancount"),
+        "include \"accounts.beancount\"\ninclude \"ledger/2025-01.beancount\"\n",
+    )
+    .expect("write root");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let sub_uri = uri_for(&sub_path);
+    let sub_src = std::fs::read_to_string(&sub_path).expect("read sub");
+    client.open_document(&sub_uri, &sub_src);
+
+    let offenders = drain_e1001_for(&mut client, &sub_uri);
+    assert!(
+        offenders.is_empty(),
+        "E1001 under a root named `m1.beancount`; got: {offenders:?}"
+    );
+}
+
+/// Probing a root against one file must not disqualify it for another.
+///
+/// Whether a root qualifies depends on the file being opened, so the answer
+/// cannot be cached as a flat "rejected". It was, and the result was that a
+/// root probed while looking for one file could never be adopted for any
+/// other, including for ITSELF: open a scratch file first and the real ledger
+/// stayed broken for the rest of the session.
+#[test]
+fn a_root_probed_for_one_file_is_still_adoptable_for_another() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("accounts.beancount"),
+        "2025-01-01 open Assets:Cash EUR\n2025-01-01 open Expenses:Food EUR\n",
+    )
+    .expect("write accounts");
+    let txns = tmp.path().join("txns.beancount");
+    std::fs::write(
+        &txns,
+        "2026-01-01 * \"lunch\"\n  Assets:Cash   -5 EUR\n  Expenses:Food  5 EUR\n",
+    )
+    .expect("write txns");
+    std::fs::write(
+        tmp.path().join("m1.beancount"),
+        "include \"accounts.beancount\"\ninclude \"txns.beancount\"\n",
+    )
+    .expect("write root");
+
+    // Not part of that ledger, and opened first, so the root is probed against
+    // it and found not to reach it.
+    let scratch = tmp.path().join("scratch.beancount");
+    std::fs::write(&scratch, "2026-03-01 balance Assets:Other 0.00 EUR\n").expect("write scratch");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let scratch_uri = uri_for(&scratch);
+    let scratch_src = std::fs::read_to_string(&scratch).expect("read scratch");
+    client.open_document(&scratch_uri, &scratch_src);
+    // Its account really is unopened, so this is correct and only here to make
+    // sure the probe has happened before the next open.
+    let _ = drain_e1001_for(&mut client, &scratch_uri);
+
+    let txns_uri = uri_for(&txns);
+    let txns_src = std::fs::read_to_string(&txns).expect("read txns");
+    client.open_document(&txns_uri, &txns_src);
+
+    let offenders = drain_e1001_for(&mut client, &txns_uri);
+    assert!(
+        offenders.is_empty(),
+        "a root probed against an unrelated file first was never adoptable again; got: {offenders:?}"
+    );
+}
+
+/// A master ledger beats a nested sub-ledger that also reaches the file.
+///
+/// A master that includes self-contained sub-ledgers, each usable on its own,
+/// is a legitimate beancount layout (#1546). Both roots reach the file, so the
+/// order candidates are tried in decides which one answers, and the master is
+/// the one that gives complete cross-file validation: adopting the inner
+/// ledger validates against a partial one and reports accounts the master
+/// opens as never opened, which is #2285 again by another route.
+///
+/// The ordering that produces this is by source, conventional names before
+/// include-declaring files, rather than by distance. `discover_journal_upward`
+/// documents "nearest wins" for its own search and this deliberately does not
+/// extend that across sources, because nearest and most-complete point in
+/// opposite directions here.
+#[test]
+fn a_master_ledger_beats_a_nested_sub_ledger() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir");
+
+    std::fs::write(
+        tmp.path().join("accounts.beancount"),
+        "2025-01-01 open Assets:Cash EUR\n",
+    )
+    .expect("write accounts");
+    let txns = sub.join("txns.beancount");
+    std::fs::write(
+        &txns,
+        "2026-01-01 * \"x\"\n  Assets:Cash   -5 EUR\n  Expenses:Food  5 EUR\n",
+    )
+    .expect("write txns");
+
+    // The master opens BOTH accounts.
+    std::fs::write(
+        tmp.path().join("main.beancount"),
+        "2025-01-01 open Expenses:Food EUR\n         include \"accounts.beancount\"\ninclude \"sub/txns.beancount\"\n",
+    )
+    .expect("write master");
+    // The nested root opens only one, so adopting it leaves the other
+    // reported as never opened.
+    std::fs::write(
+        sub.join("m1.beancount"),
+        "include \"../accounts.beancount\"\ninclude \"txns.beancount\"\n",
+    )
+    .expect("write nested");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    let txns_uri = uri_for(&txns);
+    let txns_src = std::fs::read_to_string(&txns).expect("read txns");
+    client.open_document(&txns_uri, &txns_src);
+
+    let offenders = drain_e1001_for(&mut client, &txns_uri);
+    assert!(
+        offenders.is_empty(),
+        "the nested sub-ledger answered instead of the master, so an account \
+         the master opens reads as never opened; got: {offenders:?}"
+    );
+}
+
+/// A root that will not load must not be adopted, because adoption is sticky.
+///
+/// `journal_file.is_some()` is what stops a second adoption, so pinning it to
+/// a path that failed to load would lock the session out of the real root for
+/// good: every later file would keep falling through to single-file mode and
+/// keep reporting #2285's false `E1001`.
+///
+/// Asserts a POSITIVE consequence of adoption rather than the absence of a
+/// diagnostic: the error in the unopened included file is published under its
+/// own URI, which can only happen once the ledger is loaded. An
+/// absence-assertion is satisfied by an empty publish and so cannot tell
+/// "clean" from "never checked" -- the first draft of this test passed with
+/// the guard removed for exactly that reason.
+#[test]
+fn issue_2285_a_failed_adoption_does_not_block_the_real_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let broken_path = tmp.path().join("broken.beancount");
+    std::fs::write(&broken_path, "include \"does-not-exist.beancount\"\n").expect("write broken");
+
+    let good_path = tmp.path().join("m1.beancount");
+    let included_path = tmp.path().join("m1-included.beancount");
+    std::fs::write(
+        &included_path,
+        "2025-01-01 open Assets:Cash USD\n         2025-01-01 open Expenses:Food USD\n         2025-02-01 * \"unbalanced in the include\"\n  \
+           Assets:Cash   -5 USD\n  \
+           Expenses:Food   3 USD\n",
+    )
+    .expect("write included");
+    std::fs::write(
+        &good_path,
+        format!("include \"{}\"\n", include_name(&included_path)),
+    )
+    .expect("write good");
+
+    let mut client = LspTestClient::spawn();
+    client.initialize();
+
+    // The unloadable one first, so it gets the chance to pin `journal_file`.
+    let broken_uri = uri_for(&broken_path);
+    let broken_src = std::fs::read_to_string(&broken_path).expect("read broken");
+    client.open_document(&broken_uri, &broken_src);
+
+    let good_uri = uri_for(&good_path);
+    let good_src = std::fs::read_to_string(&good_path).expect("read good");
+    client.open_document(&good_uri, &good_src);
+
+    // The include is never opened, so a diagnostic under its URI proves the
+    // ledger was loaded, which proves the real root was adopted.
+    let included_uri = uri_for(&included_path);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut seen: Vec<String> = Vec::new();
+    let mut found = false;
+    while Instant::now() < deadline && !found {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(msg) = client.recv_with_timeout(remaining) else {
+            break;
+        };
+        if let lsp_server::Message::Notification(n) = msg
+            && n.method == "textDocument/publishDiagnostics"
+        {
+            let p: lsp_types::PublishDiagnosticsParams =
+                serde_json::from_value(n.params).expect("valid publishDiagnostics");
+            seen.push(p.uri.as_str().to_string());
+            if same_file(&p.uri, &included_uri) && !p.diagnostics.is_empty() {
+                found = true;
+            }
+        }
+    }
+
+    assert!(
+        found,
+        "a failed adoption pinned `journal_file` and locked out the real root: \
+         no diagnostics for the unopened include {included_uri}; saw {seen:?}"
+    );
+}
+
 /// Companion to the above: once the error in the unopened included file is
 /// fixed, its diagnostics must be explicitly CLEARED (an empty publish), not
 /// left lingering in the client. Exercises `publish_cross_file_diagnostics`'s

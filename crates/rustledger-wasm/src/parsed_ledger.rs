@@ -14,7 +14,7 @@ use rustledger_parser::ParseResult as ParserResult;
 use crate::cache;
 use crate::convert::directive_to_json;
 use crate::editor;
-use crate::helpers::{load_and_book, run_validation, to_js};
+use crate::helpers::{has_fatal, load_and_book, option_warnings_to_errors, run_validation, to_js};
 #[cfg(feature = "plugins")]
 use crate::types::PluginResult;
 use crate::types::{Error, FormatResult, LedgerOptions, PadResult, QueryResult};
@@ -194,7 +194,18 @@ pub struct ParsedLedger {
     /// Ledger options.
     options: LedgerOptions,
     /// Parse errors.
+    /// Parse and booking errors — the *soundness* list.
+    ///
+    /// Every operation gate below reads this and only this. An entry here means
+    /// the directive stream could not be built, so running a query over it
+    /// would be answering with data that does not exist.
     parse_errors: Vec<Error>,
+    /// Option diagnostics (E7001, E7003, ...), kept out of `parse_errors` for
+    /// the same reason they are kept out of `ProcessedLedger::errors`: an
+    /// invalid option does not make the directive stream unsound, so it must
+    /// not stop a query from running. Reported by `isValid`, `getErrors`, and
+    /// `getParseErrors`; invisible to the gates.
+    option_errors: Vec<Error>,
     /// Validation errors.
     validation_errors: Vec<Error>,
     /// Cached editor data (accounts, currencies, payees, line index).
@@ -209,6 +220,9 @@ impl ParsedLedger {
     #[wasm_bindgen(constructor)]
     pub fn new(source: &str) -> Self {
         let load = load_and_book(source);
+        // Before merging option diagnostics in: `run_validation` gates on
+        // `load.errors`, and an invalid option must not stop a ledger's real
+        // validation errors from being reported (#2299).
         let validation_errors = run_validation(&load);
         let editor_cache = editor::EditorCache::new(source, &load.parse_result);
 
@@ -218,21 +232,30 @@ impl ParsedLedger {
             directives: load.directives,
             options: load.options,
             parse_errors: load.errors,
+            option_errors: load.option_errors,
             validation_errors,
             editor_cache,
         }
     }
 
-    /// Check if the ledger is valid (no parse or validation errors).
+    /// Check if the ledger is valid (no parse or validation ERRORS).
+    ///
+    /// Warnings do not make a ledger invalid, matching `rledger check`, which
+    /// exits 0 on a warning-only ledger. Both of these vectors can hold
+    /// warnings: `run_validation` assigns severity per code, so a
+    /// warning-severity validation entry used to read as invalid here (#2291).
     #[wasm_bindgen(js_name = "isValid")]
     pub fn is_valid(&self) -> bool {
-        self.parse_errors.is_empty() && self.validation_errors.is_empty()
+        !has_fatal(&self.parse_errors)
+            && !has_fatal(&self.option_errors)
+            && !has_fatal(&self.validation_errors)
     }
 
     /// Get all errors (parse + validation).
     #[wasm_bindgen(js_name = "getErrors")]
     pub fn get_errors(&self) -> Result<JsValue, JsError> {
         let mut all_errors = self.parse_errors.clone();
+        all_errors.extend(self.option_errors.clone());
         all_errors.extend(self.validation_errors.clone());
         to_js(&all_errors)
     }
@@ -240,7 +263,11 @@ impl ParsedLedger {
     /// Get parse errors only.
     #[wasm_bindgen(js_name = "getParseErrors")]
     pub fn get_parse_errors(&self) -> Result<JsValue, JsError> {
-        to_js(&self.parse_errors)
+        // Option diagnostics carry `phase: "parse"`, so they belong in the
+        // parse-phase view even though the gates must not see them.
+        let mut errors = self.parse_errors.clone();
+        errors.extend(self.option_errors.clone());
+        to_js(&errors)
     }
 
     /// Get validation errors only.
@@ -426,6 +453,7 @@ impl ParsedLedger {
             directives: self.directives.clone(),
             options: self.options.clone(),
             parse_errors: self.parse_errors.clone(),
+            option_errors: self.option_errors.clone(),
             validation_errors: self.validation_errors.clone(),
         };
         cache::serialize_parsed(&payload).map_err(|e| JsError::new(&e))
@@ -458,6 +486,7 @@ impl ParsedLedger {
             directives: payload.directives,
             options: payload.options,
             parse_errors: payload.parse_errors,
+            option_errors: payload.option_errors,
             validation_errors: payload.validation_errors,
             editor_cache,
         })
@@ -506,6 +535,7 @@ pub struct Ledger {
 }
 
 #[wasm_bindgen]
+
 impl Ledger {
     /// Create a `Ledger` from multiple files with include resolution.
     ///
@@ -566,11 +596,7 @@ impl Ledger {
                 let directives: Vec<Directive> =
                     ledger.directives.into_iter().map(|s| s.value).collect();
                 let mut errors: Vec<Error> = ledger.errors.into_iter().map(Error::from).collect();
-                // Include option warnings (E7001–E7006) so WASM consumers
-                // see the same diagnostics as `rledger check` and the LSP.
-                for w in &ledger.options.warnings {
-                    errors.push(Error::new(format!("[{}] {}", w.code, w.message)));
-                }
+                errors.extend(option_warnings_to_errors(&ledger.options.warnings));
                 let editor_cache = editor::EditorCache::from_directives(&directives);
 
                 Ok(Self {
@@ -593,8 +619,13 @@ impl Ledger {
 
     /// Check if the ledger is valid (no errors).
     #[wasm_bindgen(js_name = "isValid")]
+    /// Warnings do not make a ledger invalid, matching `rledger check`, which
+    /// exits 0 on a warning-only ledger. `has_fatal` is what `api.rs` already
+    /// uses for its `valid` field; this method was still asking whether the
+    /// list was empty, so giving E7009 the right severity would not have been
+    /// enough on its own (#2291).
     pub fn is_valid(&self) -> bool {
-        self.errors.is_empty()
+        !has_fatal(&self.errors)
     }
 
     /// Get all errors.
@@ -723,5 +754,339 @@ impl Ledger {
             errors: payload.errors,
             editor_cache,
         })
+    }
+}
+
+#[cfg(test)]
+mod option_warning_severity_tests {
+    use super::*;
+    use crate::types::Severity;
+    use rustledger_loader::OptionWarning;
+
+    fn warn(code: &'static str) -> OptionWarning {
+        OptionWarning {
+            code,
+            message: "msg".to_string(),
+            option: "title".to_string(),
+            value: "v".to_string(),
+        }
+    }
+
+    /// #2291, third surface. `rledger check` exits 0 on E7003 and E7009, so a
+    /// ledger it calls clean must not arrive here carrying errors.
+    ///
+    /// The loop this replaced sent every option warning out as an `Error`,
+    /// under a comment claiming parity with `check` and the LSP: the claim
+    /// outlived the agreement.
+    #[test]
+    fn warnings_stay_warnings_and_errors_stay_errors() {
+        let mapped = option_warnings_to_errors(&[
+            warn("E7009"),
+            warn("E7003"),
+            warn("E7001"),
+            warn("E7002"),
+        ]);
+        let sev: Vec<_> = mapped.iter().map(|e| e.severity).collect();
+        assert_eq!(
+            sev,
+            vec![
+                Severity::Warning,
+                Severity::Warning,
+                Severity::Error,
+                Severity::Error
+            ],
+            "severity must follow OptionWarning::is_error, the rule `rledger check` reads"
+        );
+    }
+
+    /// The code reaches consumers as a FIELD, not as message text (#2297).
+    ///
+    /// This case used to pin the `[E7009] ` prefix, because that prefix was
+    /// the only place the code survived and #2292 could have dropped it by
+    /// accident. The code now has a field of its own, so the guard moves to
+    /// the field rather than being deleted: something still has to fail if a
+    /// future change stops carrying it.
+    ///
+    /// The message is asserted NOT to repeat it, which is what makes the
+    /// WASM text identical to the CLI's for the same warning.
+    #[test]
+    fn the_code_travels_in_its_own_field() {
+        let mapped = option_warnings_to_errors(&[warn("E7009")]);
+        assert_eq!(mapped[0].code.as_deref(), Some("E7009"));
+        assert_eq!(
+            mapped[0].phase.as_deref(),
+            Some("parse"),
+            "`rledger check` reports these under the parse phase"
+        );
+        assert_eq!(
+            mapped[0].message, "msg",
+            "the message must carry the text alone; the code has a field now"
+        );
+    }
+
+    /// A ledger whose only complaint is a warning is VALID, the same way
+    /// `rledger check` exits 0 on one.
+    ///
+    /// `Ledger::is_valid` was `errors.is_empty()`, which cannot tell a warning
+    /// from an error. `has_fatal` exists for exactly this and is what `api.rs`
+    /// uses for its `valid` field; this one method never got it. Giving E7009
+    /// the right severity was not enough on its own, because the predicate
+    /// consumers actually call never looked at severity.
+    #[test]
+    fn a_warning_only_ledger_is_valid() {
+        let ledger = Ledger {
+            directives: Vec::new(),
+            options: LedgerOptions::default(),
+            account_types: rustledger_core::AccountTypes::default(),
+            errors: option_warnings_to_errors(&[warn("E7009")]),
+            editor_cache: editor::EditorCache::from_directives(&[]),
+        };
+        assert_eq!(
+            ledger.errors.len(),
+            1,
+            "the warning must still be REPORTED, just not fatal"
+        );
+        assert!(
+            ledger.is_valid(),
+            "a ledger carrying only E7009 is valid; `rledger check` exits 0 on it"
+        );
+
+        let broken = Ledger {
+            directives: Vec::new(),
+            options: LedgerOptions::default(),
+            account_types: rustledger_core::AccountTypes::default(),
+            errors: option_warnings_to_errors(&[warn("E7001")]),
+            editor_cache: editor::EditorCache::from_directives(&[]),
+        };
+        assert!(
+            !broken.is_valid(),
+            "E7001 is an error; the ledger must not read as valid"
+        );
+    }
+
+    /// The multi-file class caches the same diagnostics and decides validity
+    /// off the restored list, so it needs the round-trip pinned too.
+    ///
+    /// `Ledger::is_valid` is `!has_fatal(&self.errors)`, reading exactly what
+    /// `from_cache` handed back. Severity is the field that decides it, and
+    /// severity is what #2291 changed without bumping `CACHE_VERSION` — so a
+    /// round-trip that silently altered it would reproduce that bug from cache.
+    #[test]
+    fn ledger_option_diagnostics_survive_the_cache_round_trip() {
+        let warning = Error::warning("Option \"title\" specified twice".to_string())
+            .with_code("E7003")
+            .with_phase("parse");
+        let fatal = Error::new("Invalid option \"nonsense_option\"".to_string())
+            .with_code("E7001")
+            .with_phase("parse");
+
+        for (label, errors, expect_valid) in [
+            ("warning only", vec![warning.clone()], true),
+            ("with an error", vec![warning, fatal], false),
+        ] {
+            let ledger = Ledger {
+                directives: Vec::new(),
+                options: LedgerOptions::default(),
+                account_types: rustledger_core::AccountTypes::default(),
+                errors,
+                editor_cache: editor::EditorCache::from_directives(&[]),
+            };
+            let restored =
+                Ledger::from_cache(&ledger.serialize().expect("serialize")).expect("restore");
+
+            let shape = |l: &Ledger| -> Vec<(Option<String>, Severity)> {
+                l.errors
+                    .iter()
+                    .map(|e| (e.code.clone(), e.severity))
+                    .collect()
+            };
+            assert_eq!(
+                shape(&restored),
+                shape(&ledger),
+                "{label}: code and severity must both survive the round trip"
+            );
+            assert_eq!(
+                restored.is_valid(),
+                expect_valid,
+                "{label}: validity is decided off the restored list"
+            );
+        }
+    }
+
+    /// The cache must carry option diagnostics, or a cached ledger reports
+    /// clean where a fresh one reports E7001.
+    ///
+    /// `from_cache` restores the archived diagnostics verbatim and re-parses
+    /// the source only for editor spans, so nothing downstream re-derives
+    /// them. The cross-version case is handled by the `CACHE_VERSION` 21 bump;
+    /// this pins the round-trip itself, which is what makes the bump
+    /// sufficient. Both lists are checked: option diagnostics must come back,
+    /// and they must come back in `option_errors` rather than leaking into the
+    /// soundness list the operation gates read.
+    #[test]
+    fn option_diagnostics_survive_the_cache_round_trip() {
+        let src = "option \"nonsense_option\" \"x\"\n2024-01-01 open Assets:Cash USD\n";
+        let fresh = ParsedLedger::new(src);
+        let restored =
+            ParsedLedger::from_cache(&fresh.serialize().expect("serialize"), src).expect("restore");
+
+        let codes = |errors: &[Error]| -> Vec<String> {
+            errors.iter().filter_map(|e| e.code.clone()).collect()
+        };
+        assert!(
+            codes(&fresh.option_errors).contains(&"E7001".to_string()),
+            "precondition: a fresh parse reports it"
+        );
+        assert_eq!(
+            codes(&restored.option_errors),
+            codes(&fresh.option_errors),
+            "a restored ledger must report what a fresh one does"
+        );
+        assert!(
+            restored.parse_errors.is_empty(),
+            "and must not restore them into the list the operation gates read"
+        );
+        assert_eq!(
+            restored.is_valid(),
+            fresh.is_valid(),
+            "and must agree on validity"
+        );
+    }
+
+    /// A warning-only ledger must still be operable.
+    ///
+    /// `rledger check` exits 0 on a duplicated option (E7003 is a warning), and
+    /// `isValid()` agrees. But `query`, `format`, `expandPads`, and `runPlugin`
+    /// gate on `!parse_errors.is_empty()` — an emptiness test, which is exactly
+    /// what #2291 replaced in `is_valid` and did not replace here. Routing
+    /// option diagnostics through that list made every one of those operations
+    /// refuse to run on a ledger reporting itself valid.
+    #[test]
+    fn a_warning_only_option_does_not_disable_operations() {
+        let src = "option \"title\" \"a\"\noption \"title\" \"b\"\n\
+2024-01-01 open Assets:Cash USD\n";
+        let parsed = ParsedLedger::new(src);
+
+        assert!(
+            parsed
+                .option_errors
+                .iter()
+                .any(|e| e.code.as_deref() == Some("E7003")),
+            "precondition: the fixture raises the warning"
+        );
+        assert!(parsed.is_valid(), "a warning-only ledger is valid");
+        assert!(
+            parsed.parse_errors.is_empty(),
+            "the gates read `parse_errors`; an option warning must not land \
+             there or every operation refuses to run while isValid() says true"
+        );
+    }
+
+    /// And an option ERROR must not disable them either: it does not make the
+    /// directive stream unsound, which is the only thing those gates mean.
+    /// `api::query` already behaves this way, so `ParsedLedger::query` doing
+    /// otherwise would be the same operation answering two ways.
+    #[test]
+    fn an_invalid_option_does_not_disable_operations() {
+        let src = "option \"nonsense_option\" \"x\"\n2024-01-01 open Assets:Cash USD\n";
+        let parsed = ParsedLedger::new(src);
+
+        assert!(!parsed.is_valid(), "precondition: E7001 makes it invalid");
+        assert!(
+            parsed.parse_errors.is_empty(),
+            "an invalid option is reported, but the directives are sound and \
+             a query over them must still run"
+        );
+    }
+
+    /// End-to-end on the surface JS actually calls. `rledger check` errors and
+    /// exits 1 on this source; `new ParsedLedger(src)` used to report a clean
+    /// ledger, because the loader's E7001 was dropped before anyone could read
+    /// it (#2299).
+    #[test]
+    fn an_invalid_option_is_visible_through_the_constructor() {
+        let src = "option \"nonsense_option\" \"x\"\n2024-01-01 open Assets:Cash USD\n";
+        let parsed = ParsedLedger::new(src);
+
+        assert!(
+            parsed
+                .option_errors
+                .iter()
+                .any(|e| e.code.as_deref() == Some("E7001")),
+            "E7001 must be reported; got {:?}",
+            parsed
+                .option_errors
+                .iter()
+                .map(|e| (&e.code, e.severity))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !parsed.is_valid(),
+            "E7001 is an error, so the ledger must not read as valid — \
+             `rledger check` exits 1 on this source"
+        );
+    }
+
+    /// And the option error must not cost the ledger its real diagnostics:
+    /// `run_validation` is gated on `load.errors`, so an option folded in
+    /// there would silently swallow the undefined-account error below.
+    #[test]
+    fn an_invalid_option_does_not_hide_a_real_validation_error() {
+        let src = "option \"nonsense_option\" \"x\"\n\
+2024-01-01 open Assets:Cash USD\n\
+2024-01-02 * \"p\"\n  Assets:Cash 1 USD\n  Assets:NeverOpened -1 USD\n";
+        let parsed = ParsedLedger::new(src);
+
+        assert!(
+            parsed
+                .option_errors
+                .iter()
+                .any(|e| e.code.as_deref() == Some("E7001")),
+            "precondition: the option error is reported"
+        );
+        assert!(
+            !parsed.validation_errors.is_empty(),
+            "the undefined-account error must survive alongside E7001"
+        );
+    }
+
+    /// The same rule on the single-source surface, through the real
+    /// constructor rather than a hand-built struct.
+    ///
+    /// A one-posting transaction is `SinglePosting` (E3004), which
+    /// `ErrorCode::is_warning` classifies as a warning, so `run_validation`
+    /// hands it back at `Severity::Warning`. The posting is zero so the
+    /// transaction still balances and E3004 is the ONLY finding: `rledger
+    /// check` prints "1 warning" and exits 0 on this exact source. `ParsedLedger::is_valid` was
+    /// `parse_errors.is_empty() && validation_errors.is_empty()`, which called
+    /// that ledger invalid while `rledger check` exits 0 on it.
+    #[test]
+    fn a_warning_only_source_is_valid_but_still_reports() {
+        let src =
+            "2024-01-01 open Assets:Cash EUR\n\n2024-02-01 * \"zero\"\n  Assets:Cash   0 EUR\n";
+        let parsed = ParsedLedger::new(src);
+        assert!(
+            parsed
+                .validation_errors
+                .iter()
+                .any(|e| e.severity == Severity::Warning),
+            "fixture must produce a warning-severity validation entry; got {:?}",
+            parsed
+                .validation_errors
+                .iter()
+                .map(|e| (&e.code, e.severity))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !parsed
+                .validation_errors
+                .iter()
+                .any(|e| e.severity == Severity::Error),
+            "fixture must not produce any hard error"
+        );
+        assert!(
+            parsed.is_valid(),
+            "a warning-only ledger is valid; `rledger check` exits 0 on it"
+        );
     }
 }

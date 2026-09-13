@@ -55,11 +55,20 @@ rledger extract [OPTIONS] [FILE]
 | `--no-header`               | CSV has no header row                                                                      |
 | `--include-zero-amounts`    | Preserve rows whose amount is exactly zero (default drops them; bank "status filler" rows) |
 
+If you name no account at all, `extract` refuses an OFX statement that
+describes a **liability** (a credit card or line of credit) rather than posting
+it to the `Assets:Bank:Checking` default, since that would invert the sign of
+every transaction and use an account you never chose. Naming one — with
+`--account`, an `importers.toml` entry, or an `open` directive plus `--ledger` —
+is always enough.
+
 ### Output Options
 
 | Option                  | Description                                                                                                                                     |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-o, --output <FILE>`   | Write output to file instead of stdout                                                                                                          |
+| `-o, --output <FILE>`   | Write output to file instead of stdout. Refuses to overwrite a file that already has content (use `--force`, or append with `>>`)               |
+| `--force`               | Allow `--output` to overwrite a non-empty file, replacing its contents                                                                         |
+| `--ledger <FILE>`       | Read importer profiles from a ledger's `open` directives (see below)                                                                           |
 | `--existing <FILE>`     | Existing ledger file for duplicate detection                                                                                                    |
 | `--suggest-categories`  | Use ML (Naive Bayes on the `--existing` ledger) to suggest accounts for transactions the rules engine didn't categorize. Requires `--existing`. |
 | `--balance <AMOUNT>`    | Append a balance assertion directive with the given amount (e.g., `1234.56`)                                                                    |
@@ -122,11 +131,125 @@ file content. It cannot be combined with manual column options like
 rledger extract statement.ofx -a Assets:Bank:Checking
 ```
 
+OFX statements carry two things beyond the transactions themselves, and both
+are used.
+
+**`FITID` becomes a link.** Every transaction gets `^ofx-<id>` from the bank's
+own transaction id, sanitized to the characters a link may contain:
+
+```beancount
+2024-01-15 * "COFFEE SHOP" ^ofx-202401150001
+  Assets:Bank:Checking  -50.00 USD
+  Expenses:Unknown
+```
+
+A link rather than a tag because it is identity, not a category. It is stable
+across re-imports even if you rewrite the payee or narration.
+
+**`LEDGERBAL` becomes a balance assertion**, dated the day after the
+statement's `DTASOF`, because a beancount `balance` asserts the balance at the
+*start* of its date while a bank states the close of business:
+
+```beancount
+2024-02-01 balance Assets:Bank:Checking  1234.56 USD
+```
+
+> **Expect this to fail on a first import, and that is the point.** The
+> assertion says "after these transactions, the account holds exactly this".
+> A ledger containing only one imported statement has no opening balance, so
+> it will not add up:
+>
+> ```
+> Balance failed for Assets:Bank:Checking: expected 1234.56 USD, got -50.00 USD
+> ```
+>
+> Give the account its opening balance (the usual `Equity:Opening-Balances`
+> pattern), or import the earlier statements, and it passes. That is the
+> assertion doing its job: it fails until the account's history is complete,
+> which is the difference between hoping an import is complete and knowing it.
+
+No assertion is emitted when the statement does not state a balance, when the
+`LEDGERBAL` is missing either its amount or its date, or when one file holds
+several statements — their balances cannot be attributed to a single account,
+and a warning says so.
+
 ### Append to Ledger
 
 ```bash
 rledger extract statement.csv -a Assets:Bank >> ledger.beancount
 ```
+
+`>>` is the right way to add to a ledger you are keeping. `--output` **replaces**
+the file rather than appending, so it is for writing a fresh file. Pointing it at
+a ledger that already has content is refused:
+
+```console
+$ rledger extract feb.csv --output ledger.beancount
+error: refusing to overwrite ledger.beancount (163 bytes)
+  --output truncates the target, which would destroy its current contents
+  try: append with `rledger extract … >> ledger.beancount`, write elsewhere,
+  or pass --force to overwrite deliberately
+```
+
+`--existing` is for duplicate detection only and does not protect a file from
+being overwritten, so naming the same file for both `--existing` and `--output`
+is refused outright.
+
+### Importer Profiles in the Ledger
+
+An account's `open` directive already declares the account and its currency,
+which are two of the three things an importer needs. `--ledger` lets it declare
+the third, so they need not be repeated in `importers.toml`:
+
+```beancount
+2024-01-01 open Liabilities:CreditCard USD
+  importer: "ofx"
+  importer-pattern: "*.qfx"
+```
+
+```bash
+rledger extract card.qfx --ledger main.beancount
+```
+
+The transactions post to `Liabilities:CreditCard` in `USD`, both taken from the
+directive. No `importers.toml` is needed for a format like OFX that describes
+its own columns.
+
+| key | meaning |
+|-----|---------|
+| `importer` | A built-in parser (`csv`, `ofx`; `qfx` is accepted for `ofx`) **or** the `name` of an `importers.toml` entry whose column mappings to use |
+| `importer-pattern` | Filename glob selecting which files this account claims |
+
+Rules worth knowing:
+
+- **Opt-in.** Without `--ledger` nothing changes. Accounts with no `importer`
+  key are ignored, so pointing it at an ordinary ledger is harmless.
+- **The currency is only taken when the account opens with exactly one.**
+  `open Assets:X USD,EUR` cannot be narrowed to one, and guessing which a
+  statement uses would be a silent wrong answer, so the CLI value applies.
+- **Both keys or neither.** `importer` without `importer-pattern` can never
+  match a file; `importer-pattern` without `importer` says which files an
+  account claims without saying how to read them. Either half alone is an
+  error, not a preference.
+- **A key with a non-string value is an error**, not an absence. `importer: 42`
+  is something you wrote on purpose, so it is not read as "no profile here".
+- **Two accounts claiming one file is an error.** Picking one would make the
+  result depend on directive order.
+- **`--importer` outranks a profile.** The flag names the entry to use, which
+  settles both the parser and the account, so a profile matched by filename is
+  dropped rather than merged — and a warning says so, since a silently ignored
+  `--ledger` would be worse than a noisy one.
+- **A ledger that does not parse is an error.** `--ledger` is an explicit
+  request to read a file, so being unable to read it is not a reason to carry
+  on with defaults.
+- **Patterns match the filename, not the path.** `importer-pattern:
+  "statements/*.qfx"` never matches, the same as `filename_pattern` in
+  `importers.toml`.
+- **A profile outranks `importers.toml` for the account and currency.** The
+  `open` directive *is* the account's declaration; a config file disagreeing
+  with it is the bug.
+- **`--ledger` is separate from `--existing`.** The latter is only about
+  duplicate detection. Passing both is fine, and they may name the same file.
 
 ### Duplicate Detection
 
