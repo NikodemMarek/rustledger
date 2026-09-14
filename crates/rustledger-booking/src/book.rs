@@ -645,33 +645,34 @@ impl BookingEngine {
                     // If not a reduction: fall through to augmentation code below
                 }
 
-                if !booked_indices.contains(&idx) {
-                    if let Some(rustledger_core::CostNumber::Total { value: total }) = cost_spec.number
+                let is_booked = booked_indices.contains(&idx);
+                if !is_booked
+                    && let Some(rustledger_core::CostNumber::Total { value: total }) =
+                        cost_spec.number
+                {
+                    // Augmentation with total cost — convert to the
+                    // post-booking `PerUnitFromTotal` shape:
+                    //   `1.763 VIIIX {{300.00 USD}}` → derived per-unit
+                    //   170.165… with total 300.00 preserved.
+                    // The preserved total is load-bearing for
+                    // precision-preserving residual math (#1026) —
+                    // division-then-multiplication at the
+                    // `rust_decimal` 28-digit ceiling loses precision.
+                    if let Some(currency) = &cost_spec.currency
+                        && !units.number.is_zero()
                     {
-                        // Augmentation with total cost — convert to the
-                        // post-booking `PerUnitFromTotal` shape:
-                        //   `1.763 VIIIX {{300.00 USD}}` → derived per-unit
-                        //   170.165… with total 300.00 preserved.
-                        // The preserved total is load-bearing for
-                        // precision-preserving residual math (#1026) —
-                        // division-then-multiplication at the
-                        // `rust_decimal` 28-digit ceiling loses precision.
-                        if let Some(currency) = &cost_spec.currency
-                            && !units.number.is_zero()
-                        {
-                            let per_unit = total / units.number.abs();
-                            result.postings[idx].cost = Some(Box::new(CostSpec {
-                                number: Some(rustledger_core::CostNumber::PerUnitFromTotal(
-                                    rustledger_core::BookedCost::new(per_unit, total, units.number),
-                                )),
-                                currency: Some(currency.clone()),
-                                // Fill in transaction date if no date specified
-                                date: cost_spec.date.or(Some(txn.date)),
-                                label: cost_spec.label.clone(),
-                                merge: cost_spec.merge,
-                            }));
-                            booked_indices.insert(idx);
-                        }
+                        let per_unit = total / units.number.abs();
+                        result.postings[idx].cost = Some(Box::new(CostSpec {
+                            number: Some(rustledger_core::CostNumber::PerUnitFromTotal(
+                                rustledger_core::BookedCost::new(per_unit, total, units.number),
+                            )),
+                            currency: Some(currency.clone()),
+                            // Fill in transaction date if no date specified
+                            date: cost_spec.date.or(Some(txn.date)),
+                            label: cost_spec.label.clone(),
+                            merge: cost_spec.merge,
+                        }));
+                        booked_indices.insert(idx);
                     }
                 }
 
@@ -1881,14 +1882,13 @@ mod tests {
         // Buy 2 CCCC at 50.00 USD each = 100.00 USD total
         let buy = Transaction::new(date(2026, 1, 1), "Buy stock")
             .with_synthesized_posting(
-                Posting::new("Assets:Stock", Amount::new(dec!(2.0), "CCCC"))
-                    .with_cost(
-                        CostSpec::empty()
-                            .with_number(rustledger_core::CostNumber::Total {
-                                value: dec!(100.00),
-                            })
-                            .with_currency("USD")
-                    )
+                Posting::new("Assets:Stock", Amount::new(dec!(2.0), "CCCC")).with_cost(
+                    CostSpec::empty()
+                        .with_number(rustledger_core::CostNumber::Total {
+                            value: dec!(100.00),
+                        })
+                        .with_currency("USD"),
+                ),
             )
             .with_synthesized_posting(Posting::new(
                 "Assets:Cash",
@@ -1901,14 +1901,13 @@ mod tests {
         // Sell 2 CCCC by specifying the lot using total cost syntax without explicit date
         let sell = Transaction::new(date(2026, 2, 1), "Sell stock")
             .with_synthesized_posting(
-                Posting::new("Assets:Stock", Amount::new(dec!(-2.0), "CCCC"))
-                    .with_cost(
-                        CostSpec::empty()
-                            .with_number(rustledger_core::CostNumber::Total {
-                                value: dec!(100.00),
-                            })
-                            .with_currency("USD")
-                    )
+                Posting::new("Assets:Stock", Amount::new(dec!(-2.0), "CCCC")).with_cost(
+                    CostSpec::empty()
+                        .with_number(rustledger_core::CostNumber::Total {
+                            value: dec!(100.00),
+                        })
+                        .with_currency("USD"),
+                ),
             )
             .with_synthesized_posting(Posting::new(
                 "Assets:Cash",
@@ -1919,13 +1918,13 @@ mod tests {
         // with a sale date (2026-02-01) date instead of preserving the acquisition date (2026-01-01),
         // causing a "No matching lot" error when apply() tries to find it.
         let booked_sell = engine.book(&sell).unwrap();
-        
+
         let sell_posting = &booked_sell.transaction.postings[0];
         let cost = sell_posting.cost.as_ref().unwrap();
-        
+
         // The date on the cost should be the acquisition date (2026, 1, 1), not the sale date
         assert_eq!(cost.date, Some(date(2026, 1, 1)));
-        
+
         engine.apply(&booked_sell.transaction).unwrap();
     }
 
