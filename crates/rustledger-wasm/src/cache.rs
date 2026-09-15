@@ -130,6 +130,18 @@ use crate::types::{Error, LedgerOptions};
 /// which is the #2291 bug served back out of the cache -- a ledger `rledger
 /// check` exits 0 on, reported invalid. Those three bumps are owed and this
 /// one pays them, so the range v20 -> v21 covers more than #2299 alone.
+/// v22: a missing `include` is reported at the directive that names it
+/// (#2322). Loader v35, unchanged -- the loader's own cache archives parsed
+/// directives, and those did not move. What moved is `Ledger`'s error list.
+/// `Ledger.fromFiles` still builds a ledger when an include is missing,
+/// `Error::from(LedgerError)` now copies the include site into `file`, `line`
+/// and `column`, and `fromCache` restores `LedgerPayload.errors` verbatim. A v21
+/// blob would hand back that error with no location, so the fix would silently
+/// not apply to any cached ledger. Same shape as v19-v21: the archived
+/// directives are identical, and what a stale blob hides is part of a
+/// diagnostic. #2322 shipped without this bump; it was missed in review, which
+/// concluded from truncated search output that `LedgerPayload` had no caller
+/// outside tests.
 /// v23: booking resolves a `{{T}}` reduction against the lot its total names
 /// (#2306, #2325). Loader v35, unchanged -- the loader archives parsed
 /// directives, and those did not move. The processed ones did: a dated
@@ -137,9 +149,7 @@ use crate::types::{Error, LedgerOptions};
 /// `PerUnitFromTotal` rebuilt from the spec, an undated one books where it used
 /// to fail with "No matching lot", and a wrong total fails where it used to
 /// book. `ParsedLedger` and `Ledger` both archive booked directives and their
-/// errors, so an older blob would serve the old answer for all three. v22 is
-/// the #2322 follow-up (include-site load errors); if this lands first, this
-/// bump invalidates those stale blobs as well.
+/// errors, so a v22 blob would serve the old answer for all three.
 pub const CACHE_VERSION: u32 = 23;
 
 /// The `rustledger-loader` cache version this one was last reconciled with.
