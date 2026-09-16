@@ -2124,6 +2124,102 @@ mod tests {
         assert_eq!(left, Decimal::ZERO);
     }
 
+    /// The total names the lot: `{{60}}` takes the dear lot and leaves the
+    /// cheap one, which is not the lot FIFO would pick. Beancount agrees.
+    #[test]
+    fn test_book_total_cost_reduction_picks_the_lot_its_total_names() {
+        for (total, survivor) in [(dec!(60.00), dec!(40.00)), (dec!(40.00), dec!(60.00))] {
+            let mut engine = BookingEngine::new();
+            for (day, cost) in [(1, dec!(40.00)), (2, dec!(60.00))] {
+                let buy = tc_trade(
+                    date(2026, 1, day),
+                    "Assets:Pick",
+                    dec!(1),
+                    "W4",
+                    tc_per_unit_cost(cost),
+                    -cost,
+                );
+                let booked = engine.book(&buy).unwrap();
+                engine.apply(&booked.transaction).unwrap();
+            }
+
+            let sell = tc_trade(
+                date(2026, 2, 1),
+                "Assets:Pick",
+                dec!(-1),
+                "W4",
+                tc_total_cost(total, None),
+                total,
+            );
+            let booked = engine
+                .book(&sell)
+                .unwrap_or_else(|e| panic!("the total names one lot: {e:?}"));
+            engine.apply(&booked.transaction).unwrap();
+
+            let left: Vec<Decimal> = engine
+                .inventory(&"Assets:Pick".into())
+                .expect("the account still holds the other lot")
+                .positions()
+                .filter(|p| p.units.currency == "W4")
+                .filter_map(|p| p.cost.as_ref().map(|c| c.number))
+                .collect();
+            assert_eq!(
+                left,
+                vec![survivor],
+                "the reduction must leave the other lot"
+            );
+        }
+    }
+
+    /// Covering a short names its lot by total too. `units.abs()` is what
+    /// lets a positive-units reduction match the negative lot (#2325).
+    #[test]
+    fn test_book_total_cost_reduction_covers_a_short() {
+        let mut engine = BookingEngine::new();
+        let short = tc_trade(
+            date(2026, 1, 1),
+            "Assets:Short",
+            dec!(-2),
+            "W5",
+            tc_total_cost(dec!(100.00), None),
+            dec!(100.00),
+        );
+        let booked = engine.book(&short).unwrap();
+        engine.apply(&booked.transaction).unwrap();
+
+        let wrong = tc_trade(
+            date(2026, 2, 1),
+            "Assets:Short",
+            dec!(2),
+            "W5",
+            tc_total_cost(dec!(90.00), None),
+            dec!(-90.00),
+        );
+        let result = engine.book(&wrong);
+        assert!(
+            tc_is_no_matching_lot(&result),
+            "a wrong total must not cover the short: {:?}",
+            result.as_ref().err()
+        );
+
+        let right = tc_trade(
+            date(2026, 2, 1),
+            "Assets:Short",
+            dec!(2),
+            "W5",
+            tc_total_cost(dec!(100.00), None),
+            dec!(-100.00),
+        );
+        let booked = engine
+            .book(&right)
+            .expect("the right total covers the short");
+        engine.apply(&booked.transaction).unwrap();
+        let left = engine
+            .inventory(&"Assets:Short".into())
+            .map_or(Decimal::ZERO, |inv| inv.units("W5"));
+        assert_eq!(left, Decimal::ZERO);
+    }
+
     #[test]
     fn test_cost_spec_currency_inference() {
         let mut engine = BookingEngine::new();
