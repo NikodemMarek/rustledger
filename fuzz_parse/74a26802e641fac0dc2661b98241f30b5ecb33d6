@@ -1,0 +1,9 @@
+,
+pop:op:N	pop:.
+pop:10,N,N
+pop:0.
+opzN,,p:N	pop:.
+pop:10,N,N
+pop:0.
+opzN,N
+pop:,N,N
