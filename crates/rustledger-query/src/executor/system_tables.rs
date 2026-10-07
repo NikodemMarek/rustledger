@@ -735,16 +735,24 @@ impl Executor<'_> {
                         doc.links.iter().map(ToString::to_string).collect(),
                         vec![doc.account.to_string()],
                     ),
+                    // `note` carries them too, since #2160 gave `Note` the
+                    // fields. This arm was Document-only because a note's
+                    // tags did not survive parsing; the comment above said so.
                     Directive::Note(note) => (
                         note.tags.iter().map(ToString::to_string).collect(),
                         note.links.iter().map(ToString::to_string).collect(),
                         vec![note.account.to_string()],
                     ),
-                    Directive::Pad(pad) => (
-                        Vec::new(),
-                        Vec::new(),
-                        vec![pad.account.to_string(), pad.source_account.to_string()],
-                    ),
+                    // A set, as beancount's `get_entry_accounts` returns: sorted
+                    // like the transaction arm, and one entry when a pad's source
+                    // is its own account.
+                    Directive::Pad(pad) => {
+                        let mut accounts =
+                            vec![pad.account.to_string(), pad.source_account.to_string()];
+                        accounts.sort();
+                        accounts.dedup();
+                        (Vec::new(), Vec::new(), accounts)
+                    }
                     _ => (Vec::new(), Vec::new(), Vec::new()),
                 };
                 (
